@@ -5,12 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sentinel-forensic-tool"
 version = "0.1.0"
-description = "Dependency-free DVR/NVR forensic acquisition and recovery workstation"
+description = "DVR/NVR forensic acquisition, recovery, and video analytics workstation"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 authors = [{name = "Aditya"}]
-dependencies = []
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8,<5",
+]
 
 [project.scripts]
 forensic-tool = "forensic_tool.cli:main"

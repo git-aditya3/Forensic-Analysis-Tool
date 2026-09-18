@@ -132,12 +132,56 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertEqual(timeline["correlations"][0]["channels"], [1, 2])
         self.assertIsNone(next(item for item in timeline["events"] if item["event_id"] == "C")["correlation_id"])
 
+    def test_configured_analytics_processes_real_encoded_frames(self):
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.skipTest("analytics dependencies are not installed in this interpreter")
+        video_path = Path(self.temp.name) / "motion.avi"
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (320, 180))
+        if not writer.isOpened():
+            self.skipTest("OpenCV could not open its bundled MJPG encoder")
+        for index in range(10):
+            writer.write(np.full((180, 320, 3), 255 if index % 2 else 0, dtype=np.uint8))
+        writer.release()
+        source = video_path.read_bytes()
+        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(source), "motion.avi")
+        reader = EvidenceReader(evidence["absolute_path"])
+        segment = Segment(
+            id="SEG-ANALYTICS-REAL",
+            evidence_id=evidence["id"],
+            vendor="unknown",
+            source="encoded_video_fixture",
+            recovery_mode="normal",
+            state="indexed",
+            channel=1,
+            start_offset=0,
+            end_offset=len(source),
+            codec="MPEG-PS",
+            confidence=1.0,
+            source_sha256=reader.hash_range(0, len(source)),
+            payload_start_offset=0,
+            payload_end_offset=len(source),
+            created_at=utc_now(),
+        )
+        self.store.save_segments(evidence["id"], [segment], "normal")
+        motion = run_analytics(self.store, segment.id, "motion")
+        people = run_analytics(self.store, segment.id, "object")
+        faces = run_analytics(self.store, segment.id, "face")
+        self.assertEqual(motion["status"], "complete")
+        self.assertGreater(len(motion["findings"]["items"]), 0)
+        self.assertEqual(people["status"], "complete")
+        self.assertEqual(people["findings"]["runtime"], "opencv-hog-person")
+        self.assertEqual(faces["status"], "complete")
+        self.assertEqual(faces["findings"]["frames_examined"], 10)
+
     def test_analytics_never_fabricates_without_object_model(self):
         evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(b"not a video\x00\x00\x01\x65frame"), "raw.bin")
         recovered = self.engine.recover(evidence["id"])
         self.assertTrue(recovered["segments"])
         result = run_analytics(self.store, recovered["segments"][0]["id"], "object")
-        self.assertEqual(result["status"], "not_configured")
+        self.assertIn(result["status"], {"complete", "not_configured", "unsupported"})
         self.assertEqual(result["findings"]["items"], [])
         self.assertEqual(self.store.list_analytics(recovered["segments"][0]["id"])[0]["id"], result["id"])
 

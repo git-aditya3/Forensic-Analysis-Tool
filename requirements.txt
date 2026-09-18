@@ -1,2 +1,4 @@
-# Sentinel has no runtime dependencies. Python 3.10+ standard library is enough.
-# Optional: install ffmpeg separately for MP4 remuxing of native exports.
+# Core video analytics dependencies are installed by the project package.
+numpy>=1.24
+opencv-python-headless>=4.8,<5
+# Optional: install ffmpeg separately for MP4 remuxing when required.

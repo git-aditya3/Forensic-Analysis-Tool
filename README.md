@@ -1,7 +1,10 @@
 # Sentinel Forensic Analysis Tool
 
-Sentinel is a dependency-free core system for the forensic examination of
-Digital Video Recorder (DVR) and Network Video Recorder (NVR) storage. It is
+Sentinel is a forensic examination system for Digital Video Recorder (DVR)
+and Network Video Recorder (NVR) storage. Its acquisition and recovery core
+uses the Python standard library; the default install also includes OpenCV
+and NumPy so post-acquisition analytics work without a separate model runtime.
+It is
 built around the problem in this repository: recorder vendors such as Dahua,
 CP Plus, Hikvision, Honeywell, TP-Link, Godrej, Uniview, and Matrix can write
 proprietary storage layouts that appear raw or unformatted to a normal
@@ -48,10 +51,11 @@ operating system.
 - **Timestamp/correlation workflow** — normalizes known timestamps to UTC with
   explicit timezone assumptions and correlates events across camera channels
   only within a configured tolerance. Untimed candidates remain untimed.
-- **Post-acquisition analytics** — motion frame-difference analysis and
-  optional OpenCV face/ONNX object detection run on derived payload artifacts.
-  Missing decoders/models return `not_configured` or `unsupported`; no finding
-  is fabricated, and analytics records retain source and derived hashes.
+- **Post-acquisition analytics** — motion frame-difference analysis, bundled
+  OpenCV Haar facial indexing, and an out-of-the-box OpenCV HOG people detector
+  run on derived payload artifacts. An optional ONNX model adds broader object
+  classes. Missing decoders/models return `not_configured` or `unsupported`; no
+  finding is fabricated, and analytics records retain source and derived hashes.
 - **Chain of custody** — SQLite audit events are hash-linked from a GENESIS
   value. Acquisition, identification, recovery, and report generation are
   recorded and the chain can be verified.
@@ -64,9 +68,11 @@ operating system.
 
 ## Quick start
 
-Python 3.10 or newer is the only runtime requirement.
+Python 3.10 or newer is required. The standard install includes NumPy and
+OpenCV headless for motion, built-in people detection, and face indexing.
 
 ```bash
+python3 -m pip install -e .
 # Start the local workstation. Bind to 0.0.0.0 for a LAN/container preview.
 python3 -m forensic_tool --data-dir data serve --host 0.0.0.0 --port 8000
 ```

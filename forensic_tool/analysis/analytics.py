@@ -37,9 +37,10 @@ def capabilities() -> Dict[str, Any]:
         "motion": {"available": cv2 is not None, "status_without_decoder": "not_configured" if cv2 is None else "available"},
         "face": {"available": bool(cv2 is not None and face_model), "status_without_decoder": "not_configured" if not face_model else "available"},
         "object": {
-            "available": bool(cv2 is not None and object_model and Path(object_model).is_file()),
+            "available": cv2 is not None,
+            "runtime": "opencv-dnn-onnx" if object_model and Path(object_model).is_file() else "opencv-hog-person" if cv2 is not None else None,
             "model_path_configured": bool(object_model),
-            "status_without_model": "not_configured",
+            "status_without_model": "available" if cv2 is not None else "not_configured",
         },
     }
 
@@ -178,20 +179,64 @@ def _run_face(result: Dict[str, Any], media_path: Path, cv2: Any, model: str) ->
 
 def _run_object(result: Dict[str, Any], media_path: Path, cv2: Any, model: str) -> Dict[str, Any]:
     model_path = model or os.environ.get("SENTINEL_OBJECT_MODEL", "")
-    if not model_path or not Path(model_path).is_file():
-        return _finish(result, "not_configured", "Object detection requires a configured ONNX model path (SENTINEL_OBJECT_MODEL or model parameter)")
+    if model_path and not Path(model_path).is_file():
+        return _finish(result, "not_configured", f"Configured object model was not found: {model_path}")
+
+    capture, error = _open_video(cv2, media_path)
+    if capture is None:
+        return _finish(result, "unsupported", error or "Media decoder unavailable")
+
+    # OpenCV ships a small, model-free HOG/SVM people detector. It provides a
+    # useful out-of-the-box object class while preserving the option to use a
+    # configured ONNX model for broader classes.
+    if not model_path:
+        try:
+            hog = cv2.HOGDescriptor()
+            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        except Exception as error:
+            capture.release()
+            return _finish(result, "unsupported", f"Built-in people detector unavailable: {error}")
+        items: List[Dict[str, Any]] = []
+        frame_index = 0
+        try:
+            while frame_index < 300:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                boxes, weights = hog.detectMultiScale(
+                    frame,
+                    winStride=(8, 8),
+                    padding=(8, 8),
+                    scale=1.05,
+                )
+                for box, weight in zip(boxes, weights):
+                    x, y, width, height = [int(value) for value in box]
+                    confidence = float(weight[0] if hasattr(weight, "__len__") else weight)
+                    items.append({
+                        "frame": frame_index,
+                        "class_id": 0,
+                        "label": "person",
+                        "confidence": round(confidence, 4),
+                        "bbox": [x, y, width, height],
+                    })
+                frame_index += 1
+        finally:
+            capture.release()
+        if frame_index == 0:
+            return _finish(result, "unsupported", "Decoder opened the payload but returned no frames")
+        result["findings"].update({"frames_examined": frame_index, "items": items, "runtime": "opencv-hog-person", "model_path": None})
+        return _finish(result, "complete", "Built-in HOG detects people only; configure an ONNX model for additional object classes.")
+
     try:
         net = cv2.dnn.readNetFromONNX(model_path)
     except Exception as error:  # OpenCV emits model-specific exceptions
+        capture.release()
         return _finish(result, "unsupported", f"Configured object model could not be loaded by OpenCV DNN: {error}")
     labels = []
     labels_path = os.environ.get("SENTINEL_OBJECT_LABELS", "")
     if labels_path and Path(labels_path).is_file():
         labels = [line.strip() for line in Path(labels_path).read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-    capture, error = _open_video(cv2, media_path)
-    if capture is None:
-        return _finish(result, "unsupported", error or "Media decoder unavailable")
-    items: List[Dict[str, Any]] = []
+    items = []
     frame_index = 0
     try:
         while frame_index < 300:
@@ -228,8 +273,6 @@ def _run_object(result: Dict[str, Any], media_path: Path, cv2: Any, model: str) 
                 if score < 0.35:
                     continue
                 center_x, center_y, box_width, box_height = [float(value) for value in row[:4]]
-                # YOLO ONNX exports usually use normalized coordinates; accept
-                # pixel coordinates as well when they exceed the unit range.
                 if max(abs(center_x), abs(center_y), abs(box_width), abs(box_height)) <= 2:
                     center_x, box_width = center_x * width, box_width * width
                     center_y, box_height = center_y * height, box_height * height
