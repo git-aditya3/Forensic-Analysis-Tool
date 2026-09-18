@@ -41,7 +41,10 @@ OBJECT_MODEL = ModelSpec(
     size=3_800_954,
     license="Apache-2.0",
     description="OpenCV Zoo NanoDet-M-plus COCO object detector",
-    alternate_urls=("https://huggingface.co/opencv/object_detection_nanodet/resolve/main/object_detection_nanodet_2022nov.onnx",),
+    alternate_urls=(
+        "https://huggingface.co/opencv/object_detection_nanodet/resolve/main/object_detection_nanodet_2022nov.onnx",
+        "https://huggingface.co/ytfeng/opencv_zoo/resolve/main/models/object_detection_nanodet/object_detection_nanodet_2022nov.onnx",
+    ),
 )
 
 FACE_MODEL = ModelSpec(
@@ -52,7 +55,11 @@ FACE_MODEL = ModelSpec(
     size=232_589,
     license="MIT",
     description="OpenCV Zoo YuNet face detector",
-    alternate_urls=("https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",),
+    alternate_urls=(
+        "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
+        "https://files.kde.org/digikam/facesengine/yunet/face_detection_yunet_2023mar.onnx",
+        "https://mirrors.ocf.berkeley.edu/kde-applicationdata/digikam/facesengine/yunet/face_detection_yunet_2023mar.onnx",
+    ),
 )
 
 COCO_LABELS = (
