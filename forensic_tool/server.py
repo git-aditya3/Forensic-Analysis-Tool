@@ -37,7 +37,7 @@ class SentinelHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         # Keep the console useful during a forensic run without logging raw
         # evidence paths or request bodies.
-        print(f"[{self.log_date_time_string}] {format % args}")
+        print(f"[{self.log_date_time_string()}] {format % args}")
 
     def _json_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -132,7 +132,7 @@ class SentinelHandler(BaseHTTPRequestHandler):
             if not case:
                 raise ApiError("Case not found", 404)
             return self._send_json(self.app.store.case_bundle(parts[2]))
-        if len(parts) == 4 and parts[:3] == ["api", "evidence", parts[2]] and parts[3] == "timeline":
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "evidence" and parts[3] == "timeline":
             return self._send_json(self.app.engine.timeline(parts[2]))
         if len(parts) == 3 and parts[:2] == ["api", "evidence"]:
             evidence = self.app.store.get_evidence(parts[2])
@@ -158,7 +158,7 @@ class SentinelHandler(BaseHTTPRequestHandler):
             output_format = query.get("format", ["native"])[0]
             exported = export_segment(self.app.store, parts[2], output_format)
             return self._send_file(Path(str(exported["path"])), str(exported["content_type"]), f'attachment; filename="{exported["filename"]}"')
-        if len(parts) == 4 and parts[:3] == ["api", "cases", parts[2]] and parts[3] == "audit":
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "cases" and parts[3] == "audit":
             self.app.store.require_case(parts[2])
             return self._send_json({"chain": self.app.store.verify_chain(parts[2]), "events": self.app.store.audit_events(parts[2])})
         raise ApiError("Route not found", 404)
@@ -173,7 +173,7 @@ class SentinelHandler(BaseHTTPRequestHandler):
                 self.app.store.create_case(body.get("title", "Untitled examination"), body.get("investigator", ""), body.get("notes", "")),
                 201,
             )
-        if len(parts) == 4 and parts[:3] == ["api", "cases", parts[2]] and parts[3] == "evidence":
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "cases" and parts[3] == "evidence":
             case_id = parts[2]
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length <= 0:

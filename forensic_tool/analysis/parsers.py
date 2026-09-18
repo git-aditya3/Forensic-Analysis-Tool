@@ -109,10 +109,15 @@ class DahuaParser(BaseParser):
         return _dedupe_candidates([*blocks, *carved])
 
     def _parse_dhav_blocks(self, reader: EvidenceReader, mode: str) -> List[Candidate]:
-        offsets = sorted(set(reader.find_all(b"DHAV", max_hits=100_000) + reader.find_all(b"dhav", max_hits=100_000)))
+        found = reader.find_signatures(
+            {"upper": b"DHAV", "lower": b"dhav"},
+            max_hits=100_000,
+        )
+        offsets = sorted(set(found["upper"] + found["lower"]))
+        headers = reader.read_many(offsets, 64)
         candidates: List[Candidate] = []
         for index, offset in enumerate(offsets):
-            header = reader.read_at(offset, 64)
+            header = headers.get(offset, b"")
             if len(header) < 16:
                 continue
             # The common DHAV family stores a bounded block length near the
@@ -155,7 +160,8 @@ class DahuaParser(BaseParser):
                 if possible_channel < 256:
                     channel = int(possible_channel)
             if len(header) >= 20:
-                timestamp = _iso_timestamp(struct.unpack_from("<Q", header, 12)[0], milliseconds=True)
+                raw_timestamp = struct.unpack_from("<Q", header, 12)[0]
+                timestamp = _iso_timestamp(raw_timestamp, milliseconds=True) or _iso_timestamp(raw_timestamp, milliseconds=False)
             candidates.append(
                 Candidate(
                     start_offset=offset,
@@ -183,25 +189,43 @@ class HikvisionParser(BaseParser):
 
     def _parse_mpeg_program_streams(self, reader: EvidenceReader, mode: str) -> List[Candidate]:
         offsets = reader.find_all(b"\x00\x00\x01\xBA", max_hits=100_000)
+        if not offsets:
+            return []
         candidates: List[Candidate] = []
-        for offset in offsets:
-            end = _next_marker(reader, offsets, offset)
-            if end - offset < 16:
-                continue
-            candidates.append(
-                Candidate(
-                    start_offset=offset,
-                    end_offset=end,
-                    source="mpeg_ps_carve",
-                    state="indexed_candidate" if mode == "normal" else "deleted_candidate",
-                    codec="MPEG-PS",
-                    confidence=0.62,
-                    notes=(
-                        "MPEG program-stream pack found near a Hikvision signature. "
-                        "HIKBTREE geometry is recorded as a detection lead; no timestamp is inferred from a raw pack."
-                    ),
+        group: List[int] = []
+        max_gap = 4 * 1024 * 1024
+        max_tail = 4 * 1024 * 1024
+
+        def flush(next_offset: Optional[int] = None) -> None:
+            if not group:
+                return
+            start = group[0]
+            last = group[-1]
+            end = min(reader.size, last + max_tail)
+            if next_offset is not None:
+                end = min(end, next_offset)
+            if end - start >= 16:
+                candidates.append(
+                    Candidate(
+                        start_offset=start,
+                        end_offset=end,
+                        source="mpeg_ps_carve",
+                        state="indexed_candidate" if mode == "normal" else "deleted_candidate",
+                        codec="MPEG-PS",
+                        confidence=0.62,
+                        notes=(
+                            "Contiguous MPEG program-stream packs found near a Hikvision signature. "
+                            "HIKBTREE geometry is recorded as a detection lead; no timestamp is inferred from a raw pack."
+                        ),
+                    )
                 )
-            )
+            group.clear()
+
+        for offset in offsets:
+            if group and offset - group[-1] > max_gap:
+                flush(offset)
+            group.append(offset)
+        flush()
         return candidates
 
 

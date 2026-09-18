@@ -227,6 +227,12 @@ class EvidenceStore:
         try:
             with destination.open("wb") as output:
                 digest = hash_stream(_TeeReader(stream, output))
+            # HTTP uploads are wrapped in a length-limited reader.  Refuse a
+            # truncated body before creating the metadata row; otherwise a
+            # network interruption could be mistaken for a complete image.
+            remaining = getattr(stream, "remaining", 0)
+            if remaining:
+                raise ValueError(f"Evidence stream ended {remaining:,} bytes before the declared length")
             # The acquired copy is intentionally read-only.  It remains readable
             # by the current process while protecting it from accidental writes.
             try:
@@ -347,8 +353,27 @@ class EvidenceStore:
         if not evidence:
             raise KeyError(f"Unknown evidence: {evidence_id}")
         values = list(segments)
+        persisted: List[Dict[str, Any]] = []
         with self._transaction() as connection:
+            existing_rows = connection.execute(
+                """SELECT * FROM segments
+                   WHERE evidence_id=? AND recovery_mode=?""",
+                (evidence_id, mode),
+            ).fetchall()
+            existing = {
+                (row["start_offset"], row["end_offset"], row["codec"], row["source"]): row
+                for row in existing_rows
+            }
+            inserted_count = 0
             for segment in values:
+                key = (segment.start_offset, segment.end_offset, segment.codec, segment.source)
+                previous = existing.get(key)
+                if previous is not None:
+                    value = dict(previous)
+                    value["size"] = max(0, value["end_offset"] - value["start_offset"])
+                    persisted.append(value)
+                    continue
+                created_at = segment.created_at or utc_now()
                 connection.execute(
                     """INSERT INTO segments(id,evidence_id,vendor,source,recovery_mode,state,channel,start_offset,end_offset,codec,confidence,start_time,end_time,source_sha256,artifact_path,notes,created_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -369,9 +394,14 @@ class EvidenceStore:
                         segment.source_sha256,
                         segment.artifact_path,
                         segment.notes,
-                        segment.created_at or utc_now(),
+                        created_at,
                     ),
                 )
+                value = segment.to_dict()
+                value["created_at"] = created_at
+                persisted.append(value)
+                existing[key] = value
+                inserted_count += 1
             self._audit_in_transaction(
                 connection,
                 evidence["case_id"],
@@ -379,11 +409,12 @@ class EvidenceStore:
                 {
                     "evidence_id": evidence_id,
                     "mode": mode,
-                    "segment_count": len(values),
-                    "segment_ids": [segment.id for segment in values],
+                    "segment_count": len(persisted),
+                    "inserted_count": inserted_count,
+                    "segment_ids": [value["id"] for value in persisted],
                 },
             )
-        return [segment.to_dict() for segment in values]
+        return persisted
 
     def list_segments(self, evidence_id: str) -> List[Dict[str, Any]]:
         with self._connect() as connection:

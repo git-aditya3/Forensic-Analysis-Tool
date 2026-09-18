@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Generator, Iterable, List, Tuple, Union
+from typing import Dict, Generator, Iterable, List, Mapping, Tuple, Union
 
 
 PathLike = Union[str, Path]
@@ -78,6 +78,62 @@ class EvidenceReader:
                 break
             carry = data[-carry_len:] if carry_len else b""
         return hits
+
+    def find_signatures(
+        self,
+        signatures: Mapping[str, bytes],
+        max_hits: int = 256,
+        chunk_size: int = 4 * 1024 * 1024,
+    ) -> Dict[str, List[int]]:
+        """Find several byte signatures in one streaming pass.
+
+        Vendor identification previously reopened and rescanned a multi-GB
+        image once per signature.  This method keeps a small overlap buffer and
+        evaluates all requested signatures while each chunk is already in
+        memory.  Matches wholly contained in the overlap are discarded so a
+        boundary match is not reported twice.
+        """
+
+        queries = {name: bytes(needle) for name, needle in signatures.items() if needle}
+        result: Dict[str, List[int]] = {name: [] for name in queries}
+        if not queries:
+            return result
+        overlap = max(len(needle) for needle in queries.values()) - 1
+        carry = b""
+        for offset, chunk in self.iter_chunks(chunk_size):
+            data = carry + chunk
+            base = offset - len(carry)
+            for name, needle in queries.items():
+                if len(result[name]) >= max_hits:
+                    continue
+                cursor = 0
+                while len(result[name]) < max_hits:
+                    found = data.find(needle, cursor)
+                    if found < 0:
+                        break
+                    # A match ending inside the overlap was already visible in
+                    # the preceding chunk.  A match crossing the boundary is
+                    # retained.
+                    if found + len(needle) > len(carry):
+                        result[name].append(base + found)
+                    cursor = found + 1
+            carry = data[-overlap:] if overlap else b""
+            if all(len(hits) >= max_hits for hits in result.values()):
+                break
+        return result
+
+    def read_many(self, offsets: Iterable[int], length: int = 1) -> Dict[int, bytes]:
+        """Read small values at many offsets while opening the source once."""
+
+        if length <= 0:
+            return {offset: b"" for offset in offsets}
+        requested = sorted({offset for offset in offsets if 0 <= offset < self.size})
+        values: Dict[int, bytes] = {}
+        with self.path.open("rb") as handle:
+            for offset in requested:
+                handle.seek(offset)
+                values[offset] = handle.read(min(length, self.size - offset))
+        return values
 
     def hash_range(self, offset: int, length: int, chunk_size: int = 4 * 1024 * 1024) -> str:
         """SHA-256 a physical byte range without changing the source."""

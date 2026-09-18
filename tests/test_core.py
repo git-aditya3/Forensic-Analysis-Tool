@@ -23,6 +23,16 @@ def annex_b_stream() -> bytes:
     )
 
 
+def h265_annex_b_stream() -> bytes:
+    return (
+        b"\x00\x00\x01\x40VPS"
+        b"\x00\x00\x01\x42SPS"
+        b"\x00\x00\x01\x44PPS"
+        b"\x00\x00\x01\x26IDRFRAME"
+        b"\x00\x00\x01\x02PFRAME"
+    )
+
+
 class CoreSystemTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -57,6 +67,12 @@ class CoreSystemTests(unittest.TestCase):
         self.assertEqual(len(segment["source_sha256"]), 64)
         self.assertIn("wall-clock", segment["notes"])
 
+    def test_h265_is_not_reported_as_duplicate_h264(self):
+        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(h265_annex_b_stream()), "camera.h265")
+        result = self.engine.recover(evidence["id"], "normal")
+        self.assertEqual(result["segment_count"], 1)
+        self.assertEqual(result["segments"][0]["codec"], "H.265")
+
     def test_dahua_bounded_block_parser(self):
         payload = annex_b_stream()
         timestamp_ms = 1700000000000
@@ -82,6 +98,14 @@ class CoreSystemTests(unittest.TestCase):
         self.assertIn("deleted_candidate", states)
         self.assertIn("fragment", states)
 
+    def test_repeated_recovery_does_not_duplicate_ranges(self):
+        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(annex_b_stream()), "repeat.bin")
+        first = self.engine.recover(evidence["id"], "normal")
+        second = self.engine.recover(evidence["id"], "normal")
+        self.assertEqual(first["segment_count"], second["segment_count"])
+        self.assertEqual(len(self.store.list_segments(evidence["id"])), first["segment_count"])
+        self.assertEqual(first["segments"][0]["id"], second["segments"][0]["id"])
+
     def test_native_export_is_exact_source_range(self):
         source = b"padding" + annex_b_stream() + b"tail"
         evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(source), "sample.bin")
@@ -106,6 +130,7 @@ class CoreSystemTests(unittest.TestCase):
         source_path.write_bytes(b"A" * (4 * 1024 * 1024 - 3) + b"HIKBTREE" + b"B")
         reader = EvidenceReader(source_path)
         self.assertEqual(reader.find_all(b"HIKBTREE"), [4 * 1024 * 1024 - 3])
+        self.assertEqual(reader.find_signatures({"hik": b"HIKBTREE", "annex": b"\x00\x00\x01"})["hik"], [4 * 1024 * 1024 - 3])
         result = detect(reader)
         self.assertEqual(result.primary.vendor, "hikvision")
 

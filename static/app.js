@@ -428,6 +428,7 @@ function wire() {
     if (file) upload(file);
   });
 
+  $('#analysis-acquire-link').addEventListener('click', () => showView('acquisition'));
   $('#identify-button').addEventListener('click', identify);
   $('#recover-button').addEventListener('click', recover);
   $('#generate-report').addEventListener('click', generateReport);

@@ -32,8 +32,12 @@ class NalMarker:
 def _start_codes(reader: EvidenceReader, max_markers: int = 200_000) -> List[Tuple[int, int]]:
     """Return unique Annex-B start codes, including chunk-boundary matches."""
 
-    three = reader.find_all(b"\x00\x00\x01", max_hits=max_markers)
-    four = reader.find_all(b"\x00\x00\x00\x01", max_hits=max_markers)
+    signatures = reader.find_signatures(
+        {"three": b"\x00\x00\x01", "four": b"\x00\x00\x00\x01"},
+        max_hits=max_markers,
+    )
+    three = signatures["three"]
+    four = signatures["four"]
     starts: Dict[int, int] = {}
     for offset in three:
         starts[offset] = 3
@@ -46,20 +50,39 @@ def _start_codes(reader: EvidenceReader, max_markers: int = 200_000) -> List[Tup
 
 
 def scan_nals(reader: EvidenceReader, max_markers: int = 200_000) -> List[NalMarker]:
-    markers: List[NalMarker] = []
-    for offset, code_length in _start_codes(reader, max_markers=max_markers):
-        header = reader.read_at(offset + code_length, 1)
+    """Scan Annex-B markers and disambiguate H.264 from H.265.
+
+    Several H.265 headers are also numerically valid H.264 NAL types.  For
+    example, an H.265 IDR header can look like H.264 SEI.  We first collect
+    the one-byte headers, then use the presence of the distinctive H.265
+    VPS/SPS/PPS types (32/33/34) to classify the ambiguous headers correctly.
+    """
+
+    starts = _start_codes(reader, max_markers=max_markers)
+    headers = reader.read_many((offset + code_length for offset, code_length in starts))
+    raw: List[Tuple[int, int, int, int]] = []
+    for offset, code_length in starts:
+        header = headers.get(offset + code_length, b"")
         if not header:
             continue
         value = header[0]
-        h264_type = value & 0x1F
-        h265_type = (value >> 1) & 0x3F
-        # H.264 parameter sets/keyframes are the most reliable signature.  A
-        # valid H.265 VPS/SPS/PPS has types 32/33/34 and is otherwise ignored
-        # by the H.264 branch.
-        if h264_type in {1, 5, 6, 7, 8, 9}:
+        raw.append((offset, code_length, value & 0x1F, (value >> 1) & 0x3F))
+
+    h265_types = {1, 19, 20, 21, 32, 33, 34, 35, 39, 40}
+    h264_types = {1, 5, 6, 7, 8, 9}
+    has_h265_parameter_sets = any(h265_type in {32, 33, 34} for _offset, _length, _h264, h265_type in raw)
+    markers: List[NalMarker] = []
+    for offset, code_length, h264_type, h265_type in raw:
+        # H.265 random-access types 19/20/21 have header bytes that can look
+        # like H.264 SEI/PPS.  Prefer that interpretation even in a fragment
+        # where the VPS/SPS/PPS were overwritten, while leaving ordinary H.264
+        # slice headers untouched.
+        h265_random_access = h265_type in {19, 20, 21} and h264_type not in {5, 7, 9}
+        if (has_h265_parameter_sets or h265_random_access) and h265_type in h265_types:
+            markers.append(NalMarker(offset, code_length, "H.265", h265_type))
+        elif h264_type in h264_types:
             markers.append(NalMarker(offset, code_length, "H.264", h264_type))
-        elif h265_type in {1, 19, 20, 21, 32, 33, 34, 35, 39, 40}:
+        elif h265_type in h265_types:
             markers.append(NalMarker(offset, code_length, "H.265", h265_type))
     return markers
 
@@ -87,12 +110,15 @@ def _group_markers(
                 return
             start = group[0].offset
             last = group[-1].offset
+            # No container length exists in raw Annex-B.  Keep the range
+            # bounded even when the next marker is many gigabytes away; a
+            # sparse disk image must never turn one false marker into a
+            # whole-disk export.
+            max_tail = 4 * 1024 * 1024
             if next_offset is not None and next_offset > last:
-                end = next_offset
+                end = min(next_offset, last + max_tail)
             else:
-                # No container length exists in raw Annex-B.  Keep a bounded
-                # tail so carving a false marker can never copy the whole disk.
-                end = min(file_size, last + 4 * 1024 * 1024)
+                end = min(file_size, last + max_tail)
             end = max(start + group[-1].code_length + 1, min(file_size, end))
             base = 0.66 if codec == "H.264" else 0.60
             if meaningful:

@@ -151,10 +151,18 @@ def _hit(profile: VendorProfile, matched: List[Tuple[str, int, float]]) -> Vendo
 
 def detect(reader: EvidenceReader) -> DetectionResult:
     hits: List[VendorHit] = []
+    signature_queries = {
+        f"{profile.code}:{name}": signature
+        for profile in PROFILES
+        for name, signature, _weight in profile.signatures
+    }
+    signature_queries["__annex_three"] = b"\x00\x00\x01"
+    signature_queries["__annex_four"] = b"\x00\x00\x00\x01"
+    signature_hits = reader.find_signatures(signature_queries, max_hits=16)
     for profile in PROFILES:
         matches: List[Tuple[str, int, float]] = []
-        for name, signature, weight in profile.signatures:
-            offsets = reader.find_all(signature, max_hits=16)
+        for name, _signature, weight in profile.signatures:
+            offsets = signature_hits.get(f"{profile.code}:{name}", [])
             matches.extend((name, offset, weight) for offset in offsets)
         if matches:
             hits.append(_hit(profile, matches))
@@ -163,7 +171,13 @@ def detect(reader: EvidenceReader) -> DetectionResult:
     # report that honestly as an unknown/generic route rather than inventing a
     # manufacturer identity.
     if not hits:
-        annexb = reader.find_all(b"\x00\x00\x00\x01", max_hits=16)
+        # Both three- and four-byte Annex-B start codes are common in raw
+        # recorder streams.  Keep the reported offsets unique and point to the
+        # actual marker start for the generic evidence lead.
+        three_byte = signature_hits.get("__annex_three", [])
+        four_byte = signature_hits.get("__annex_four", [])
+        four_starts = set(four_byte)
+        annexb = sorted(four_starts | {offset for offset in three_byte if offset - 1 not in four_starts})
         generic = VendorHit(
             vendor="unknown",
             display_name="Unknown / generic media",
