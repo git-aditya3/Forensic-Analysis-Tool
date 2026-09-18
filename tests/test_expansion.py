@@ -228,11 +228,11 @@ class ExpansionWorkflowTests(unittest.TestCase):
         except ImportError:
             self.skipTest("analytics dependencies are not installed in this interpreter")
         video_path = Path(self.temp.name) / "motion.avi"
-        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (320, 180))
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (160, 90))
         if not writer.isOpened():
             self.skipTest("OpenCV could not open its bundled MJPG encoder")
         for index in range(10):
-            writer.write(np.full((180, 320, 3), 255 if index % 2 else 0, dtype=np.uint8))
+            writer.write(np.full((90, 160, 3), 255 if index % 2 else 0, dtype=np.uint8))
         writer.release()
         source = video_path.read_bytes()
         evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(source), "motion.avi")

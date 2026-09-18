@@ -519,16 +519,25 @@ def _run_hog(result: Dict[str, Any], media_path: Path, cv2: Any, model_status: O
     items: List[Dict[str, Any]] = []
 
     def process(frame_index: int, frame: Any) -> None:
-        boxes, weights = hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+        # OpenCV's default pedestrian window is 64x128. Some DVR thumbnails
+        # are smaller than that and older OpenCV builds can abort in native code
+        # instead of returning an empty detection set. Upscale only for the
+        # detector and map boxes back to the original frame coordinates.
+        height, width = frame.shape[:2]
+        scale = max(1.0, 128.0 / max(height, 1), 64.0 / max(width, 1))
+        detector_frame = frame
+        if scale > 1.0:
+            detector_frame = cv2.resize(frame, (max(64, int(round(width * scale))), max(128, int(round(height * scale)))))
+        boxes, weights = hog.detectMultiScale(detector_frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
         for box, weight in zip(boxes, weights):
-            x, y, width, height = [int(value) for value in box]
+            x, y, box_width, box_height = [int(round(value / scale)) for value in box]
             confidence = float(weight[0] if hasattr(weight, "__len__") else weight)
             items.append({
                 "frame": frame_index,
                 "class_id": 0,
                 "label": "person",
                 "confidence": round(confidence, 4),
-                "bbox": [x, y, width, height],
+                "bbox": [x, y, box_width, box_height],
             })
 
     count, decoder, error = _process_frames(cv2, media_path, process)
