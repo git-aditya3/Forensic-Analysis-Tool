@@ -216,6 +216,7 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
                 actual_sha256=spec.sha256,
                 downloaded_from=source_url,
                 replaced_invalid_cache=invalid_cache is not None,
+                rejected_cache=invalid_cache,
             )
         except Exception as error:
             errors.append(f"{source_url}: {error}")
@@ -224,4 +225,4 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
                     temporary_name.unlink()
                 except OSError:
                     pass
-    return None, _metadata(spec, None, "unavailable", error="; ".join(errors))
+    return None, _metadata(spec, None, "unavailable", error="; ".join(errors), rejected_cache=invalid_cache)
