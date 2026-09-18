@@ -28,6 +28,7 @@ class ModelSpec:
     size: int
     license: str
     description: str
+    alternate_urls: tuple[str, ...] = ()
 
 
 # OpenCV Zoo assets.  The expected hashes are the Git LFS object hashes and
@@ -40,6 +41,7 @@ OBJECT_MODEL = ModelSpec(
     size=3_800_954,
     license="Apache-2.0",
     description="OpenCV Zoo NanoDet-M-plus COCO object detector",
+    alternate_urls=("https://huggingface.co/opencv/object_detection_nanodet/resolve/main/object_detection_nanodet_2022nov.onnx",),
 )
 
 FACE_MODEL = ModelSpec(
@@ -50,6 +52,7 @@ FACE_MODEL = ModelSpec(
     size=232_589,
     license="MIT",
     description="OpenCV Zoo YuNet face detector",
+    alternate_urls=("https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",),
 )
 
 COCO_LABELS = (
@@ -95,6 +98,7 @@ def _metadata(spec: ModelSpec, path: Optional[Path], status: str, **extra: Any) 
         "description": spec.description,
         "license": spec.license,
         "source": spec.url,
+        "sources": [spec.url, *spec.alternate_urls],
         "expected_sha256": spec.sha256,
         "expected_size": spec.size,
         "status": status,
@@ -136,39 +140,54 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
     if not auto_download:
         return None, _metadata(spec, None, "not_configured", error="Automatic model download is disabled.")
 
-    temporary_name: Optional[Path] = None
     try:
         root.mkdir(parents=True, exist_ok=True)
-        request = Request(spec.url, headers={"User-Agent": "sentinel-forensic-tool/0.1"})
-        with urlopen(request, timeout=float(os.environ.get("SENTINEL_MODEL_DOWNLOAD_TIMEOUT", "30"))) as response:
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) != spec.size:
-                raise ValueError(f"download size {content_length} does not match expected {spec.size}")
-            with tempfile.NamedTemporaryFile(prefix=f".{spec.filename}.", suffix=".download", dir=root, delete=False) as temporary:
-                temporary_name = Path(temporary.name)
-                copied = 0
-                while True:
-                    block = response.read(1024 * 1024)
-                    if not block:
-                        break
-                    copied += len(block)
-                    if copied > spec.size:
-                        raise ValueError("download exceeded the expected model size")
-                    temporary.write(block)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-        if copied != spec.size or _sha256(temporary_name) != spec.sha256:
-            raise ValueError("download failed the expected size or SHA-256 check")
-        try:
-            temporary_name.chmod(0o440)
-        except OSError:
-            pass
-        os.replace(temporary_name, path)
-        return path, _metadata(spec, path, "downloaded", actual_sha256=spec.sha256, replaced_invalid_cache=invalid_cache is not None)
     except Exception as error:
-        if temporary_name is not None:
+        return None, _metadata(spec, None, "unavailable", error=str(error))
+
+    errors = []
+    timeout = float(os.environ.get("SENTINEL_MODEL_DOWNLOAD_TIMEOUT", "30"))
+    for source_url in (spec.url, *spec.alternate_urls):
+        temporary_name: Optional[Path] = None
+        try:
+            request = Request(source_url, headers={"User-Agent": "sentinel-forensic-tool/0.1"})
+            with urlopen(request, timeout=timeout) as response:
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) != spec.size:
+                    raise ValueError(f"download size {content_length} does not match expected {spec.size}")
+                with tempfile.NamedTemporaryFile(prefix=f".{spec.filename}.", suffix=".download", dir=root, delete=False) as temporary:
+                    temporary_name = Path(temporary.name)
+                    copied = 0
+                    while True:
+                        block = response.read(1024 * 1024)
+                        if not block:
+                            break
+                        copied += len(block)
+                        if copied > spec.size:
+                            raise ValueError("download exceeded the expected model size")
+                        temporary.write(block)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+            if copied != spec.size or _sha256(temporary_name) != spec.sha256:
+                raise ValueError("download failed the expected size or SHA-256 check")
             try:
-                temporary_name.unlink()
+                temporary_name.chmod(0o440)
             except OSError:
                 pass
-        return None, _metadata(spec, None, "unavailable", error=str(error))
+            os.replace(temporary_name, path)
+            return path, _metadata(
+                spec,
+                path,
+                "downloaded",
+                actual_sha256=spec.sha256,
+                downloaded_from=source_url,
+                replaced_invalid_cache=invalid_cache is not None,
+            )
+        except Exception as error:
+            errors.append(f"{source_url}: {error}")
+            if temporary_name is not None:
+                try:
+                    temporary_name.unlink()
+                except OSError:
+                    pass
+    return None, _metadata(spec, None, "unavailable", error="; ".join(errors))

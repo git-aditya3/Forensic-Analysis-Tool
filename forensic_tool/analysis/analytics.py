@@ -26,7 +26,14 @@ from .model_registry import COCO_LABELS, FACE_MODEL, OBJECT_MODEL, describe_mode
 
 
 KINDS = {"motion", "object", "face"}
-MAX_FRAMES = 300
+
+
+def _frame_limit() -> int:
+    """Return an explicit safety cap; zero means process the whole segment."""
+    try:
+        return max(0, int(os.environ.get("SENTINEL_ANALYTICS_MAX_FRAMES", "0")))
+    except ValueError:
+        return 0
 
 
 def _ffmpeg_info() -> Dict[str, Any]:
@@ -148,10 +155,10 @@ def _load_cv2() -> Tuple[Optional[Any], Optional[str]]:
 class _FrameStream:
     """Decode with OpenCV first and a bundled FFmpeg fallback second."""
 
-    def __init__(self, cv2: Any, path: Path, limit: int = MAX_FRAMES):
+    def __init__(self, cv2: Any, path: Path, limit: Optional[int] = None):
         self.cv2 = cv2
         self.path = path
-        self.limit = limit
+        self.limit = _frame_limit() if limit is None else max(0, limit)
         self.decoder: Optional[str] = None
         self.error: Optional[str] = None
         self.frames = 0
@@ -253,7 +260,7 @@ class _FrameStream:
         raise StopIteration
 
     def __next__(self) -> Tuple[int, Any]:
-        if self.frames >= self.limit:
+        if self.limit and self.frames >= self.limit:
             self._finished = True
             self.close()
             raise StopIteration

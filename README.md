@@ -158,6 +158,9 @@ artifact hash. This keeps model provenance separate from immutable evidence.
 - Set `SENTINEL_AUTO_DOWNLOAD_MODELS=0` for an offline lab. The deterministic
   fallbacks remain available and the result says exactly which model was not
   used. Set `SENTINEL_MODEL_DIR` to a controlled, pre-approved model cache.
+- Analytics processes the complete bounded segment by default. Set
+  `SENTINEL_ANALYTICS_MAX_FRAMES` to a positive value only when an examiner
+  deliberately wants a resource cap.
 
 Face results intentionally remain detection/index records. Sentinel does not
 perform face recognition, name a person, or make a biometric identity claim.
