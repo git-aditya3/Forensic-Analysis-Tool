@@ -76,6 +76,23 @@ function currentCaseId() {
   return state.currentCase?.id || '';
 }
 
+function analyticsSummary(latest) {
+  if (!latest) return '';
+  const findings = latest.findings || {};
+  const items = Array.isArray(findings.items) ? findings.items : [];
+  const detector = findings.runtime || findings.detector || 'decoder-only';
+  const decoder = findings.decoder || 'not reported';
+  const validation = findings.validation?.status || 'not validated';
+  const nms = findings.nms?.applied ? `NMS ${findings.nms.method || 'applied'} · IoU ${findings.nms.iou_threshold ?? '—'}` : `NMS not applied · ${findings.nms?.method || 'not applicable'}`;
+  const previews = items.slice(0, 4).map((item) => {
+    const box = Array.isArray(item.bbox) ? ` · box ${item.bbox.join(',')}` : '';
+    const confidence = item.confidence == null ? '' : ` · ${Number(item.confidence).toFixed(2)}`;
+    return `<span>${esc(item.label || item.type || 'finding')} · frame ${esc(item.frame)}${confidence}${box}</span>`;
+  }).join('');
+  const itemText = `${items.length} finding${items.length === 1 ? '' : 's'}`;
+  return `<div class="analytics-result"><div class="analytics-result-head"><strong>${esc(latest.kind)} · ${esc(latest.status)}</strong><span>${esc(itemText)} · ${esc(String(findings.frames_examined ?? 0))} frames</span></div><div class="analytics-result-meta">${esc(detector)} · ${esc(decoder)} · validation ${esc(validation)} · ${esc(nms)}</div>${previews ? `<div class="analytics-findings">${previews}</div>` : ''}${latest.notes ? `<small>${esc(latest.notes)}</small>` : ''}</div>`;
+}
+
 function selectedMode() {
   return document.querySelector('input[name="mode"]:checked')?.value || 'normal';
 }
@@ -212,7 +229,7 @@ function renderAnalysis() {
     segList.innerHTML = '<div class="empty-state compact"><div class="empty-icon">⌁</div><span>Run recovery to populate the evidence timeline.</span></div>';
     return;
   }
-  segList.innerHTML = segments.map((seg, index) => { const latest = (seg.analytics || [])[0]; return `<div class="segment-row"><div class="segment-index">RANGE ${String(index + 1).padStart(2, '0')}</div><div class="segment-title">${esc(seg.codec)} · ${esc(seg.state)}<small>${esc(seg.source)} · ${bytes(seg.size)} · offset 0x${Number(seg.start_offset).toString(16).toUpperCase()}${seg.payload_start_offset != null ? ` · payload 0x${Number(seg.payload_start_offset).toString(16).toUpperCase()}–0x${Number(seg.payload_end_offset).toString(16).toUpperCase()}` : ''}</small></div><div class="segment-facts"><strong>${Math.round((seg.confidence || 0) * 100)}%</strong><small>${esc(seg.recovery_mode)}</small></div><div class="segment-actions"><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=native">↓ Native</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=media">◈ Media payload</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=mp4">▶ MP4</a><select class="analytics-kind" data-segment="${esc(seg.id)}"><option value="motion">Motion</option><option value="object">People / objects</option><option value="face">Faces (index only)</option></select><button class="tiny-link run-analytics" data-segment="${esc(seg.id)}">Run</button>${latest ? `<span class="status-pill ${esc(latest.status)}">${esc(latest.kind)}: ${esc(latest.status)}</span>` : ''}</div></div>`; }).join('');
+  segList.innerHTML = segments.map((seg, index) => { const latest = (seg.analytics || [])[0]; return `<div class="segment-row"><div class="segment-index">RANGE ${String(index + 1).padStart(2, '0')}</div><div class="segment-title">${esc(seg.codec)} · ${esc(seg.state)}<small>${esc(seg.source)} · ${bytes(seg.size)} · offset 0x${Number(seg.start_offset).toString(16).toUpperCase()}${seg.payload_start_offset != null ? ` · payload 0x${Number(seg.payload_start_offset).toString(16).toUpperCase()}–0x${Number(seg.payload_end_offset).toString(16).toUpperCase()}` : ''}</small></div><div class="segment-facts"><strong>${Math.round((seg.confidence || 0) * 100)}%</strong><small>${esc(seg.recovery_mode)}</small></div><div class="segment-actions"><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=native">↓ Native</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=media">◈ Media payload</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=mp4">▶ MP4</a><select class="analytics-kind" data-segment="${esc(seg.id)}"><option value="motion">Motion</option><option value="object">People / objects</option><option value="face">Faces (index only)</option></select><button class="tiny-link run-analytics" data-segment="${esc(seg.id)}">Run</button>${latest ? `<span class="status-pill ${esc(latest.status)}">${esc(latest.kind)}: ${esc(latest.status)}</span>` : ''}</div>${analyticsSummary(latest)}</div></div>`; }).join('');
   $$('.run-analytics').forEach((button) => button.addEventListener('click', () => runAnalytics(button.dataset.segment, button.parentElement.querySelector('.analytics-kind')?.value || 'motion', button)));
 }
 
