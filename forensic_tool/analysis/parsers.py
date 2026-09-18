@@ -227,6 +227,9 @@ class DahuaParser(BaseParser):
             if codec == "unknown":
                 codec = "DHAV-audio" if frame_type in {0xF0, 0xF1} else "DHAV"
             timestamp = _dhav_date_to_iso(packed_date, timestamp_ms)
+            payload_end = max(payload_offset, end - 8 if footer_valid else end)
+            payload_start_value = payload_offset if payload_end > payload_offset else None
+            payload_end_value = payload_end if payload_end > payload_offset else None
             candidates.append(
                 Candidate(
                     start_offset=offset,
@@ -237,8 +240,8 @@ class DahuaParser(BaseParser):
                     confidence=confidence,
                     channel=channel if channel < 256 else None,
                     start_time=timestamp,
-                    payload_start_offset=payload_offset,
-                    payload_end_offset=max(payload_offset, end - 8 if footer_valid else end),
+                    payload_start_offset=payload_start_value,
+                    payload_end_offset=payload_end_value,
                     notes=(
                         f"DHAV type 0x{frame_type:02X}; channel {channel}. "
                         + note

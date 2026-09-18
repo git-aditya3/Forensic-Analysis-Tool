@@ -455,6 +455,14 @@ class EvidenceStore:
         if not evidence:
             raise KeyError(f"Unknown evidence: {evidence_id}")
         values = list(segments)
+        for segment in values:
+            if segment.start_offset < 0 or segment.end_offset <= segment.start_offset or segment.end_offset > int(evidence["size"]):
+                raise ValueError("segment physical range is outside the acquired evidence")
+            payload_start = segment.payload_start_offset
+            payload_end = segment.payload_end_offset
+            if payload_start is not None or payload_end is not None:
+                if payload_start is None or payload_end is None or not (segment.start_offset <= payload_start < payload_end <= segment.end_offset):
+                    raise ValueError("segment payload range must be bounded by the physical segment range")
         persisted: List[Dict[str, Any]] = []
         with self._transaction() as connection:
             existing_rows = connection.execute(
