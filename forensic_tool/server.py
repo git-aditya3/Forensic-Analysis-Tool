@@ -124,7 +124,9 @@ class SentinelHandler(BaseHTTPRequestHandler):
             return self._static(path.removeprefix("/static/"))
         parts = [urllib.parse.unquote(part) for part in path.strip("/").split("/") if part]
         if parts == ["api", "health"]:
-            return self._send_json({"ok": True, "service": "sentinel", "version": __version__})
+            return self._send_json({"ok": True, "service": "sentinel", "version": __version__, "capabilities": self.app.engine.capabilities()})
+        if parts == ["api", "capabilities"]:
+            return self._send_json(self.app.engine.capabilities())
         if parts == ["api", "cases"]:
             return self._send_json({"cases": self.app.store.list_cases()})
         if len(parts) == 3 and parts[:2] == ["api", "cases"]:

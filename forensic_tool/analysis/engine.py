@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from ..models import Segment
 from ..storage import EvidenceStore, utc_now
 from .detector import DetectionResult, detect
-from .analytics import run_analytics
+from .analytics import capabilities, run_analytics
 from .device import identify_device
 from .parsers import Candidate, parser_for
 from .timeline import build_timeline
@@ -45,7 +45,7 @@ class AnalysisEngine:
     def _dedupe(self, candidates: Iterable[Candidate]) -> List[Candidate]:
         """Prefer parser-backed ranges over generic carves with same bytes."""
 
-        priority = {"dhav_parser": 3, "mpeg_ps_carve": 2, "honeywell_index_lead": 2, "annexb_carve": 1}
+        priority = {"dhav_parser": 3, "honeywell_custom_header": 3, "mpeg_ps_carve": 2, "honeywell_index_lead": 2, "annexb_carve": 1}
         ordered = sorted(candidates, key=lambda item: (priority.get(item.source, 0), item.confidence), reverse=True)
         kept: List[Candidate] = []
         for candidate in ordered:
@@ -141,3 +141,7 @@ class AnalysisEngine:
 
     def analytics(self, segment_id: str, kind: str, model: str = "") -> Dict[str, Any]:
         return run_analytics(self.store, segment_id, kind, model)
+
+    @staticmethod
+    def capabilities() -> Dict[str, Any]:
+        return capabilities()

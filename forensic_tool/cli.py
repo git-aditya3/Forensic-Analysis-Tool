@@ -73,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="re-hash acquired evidence and append an integrity event")
     verify.add_argument("evidence_id")
 
+    capabilities = commands.add_parser("capabilities", help="show optional decoder and model availability")
+
     analytics = commands.add_parser("analytics", help="run optional post-acquisition media analytics")
     analytics.add_argument("segment_id")
     analytics.add_argument("--kind", choices=["motion", "object", "face"], required=True)
@@ -125,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(AnalysisEngine(store).correlate_case(args.case_id, args.tolerance))
         elif args.command == "verify":
             _print(store.verify_evidence(args.evidence_id))
+        elif args.command == "capabilities":
+            _print(AnalysisEngine.capabilities())
         elif args.command == "analytics":
             _print(AnalysisEngine(store).analytics(args.segment_id, args.kind, args.model))
         elif args.command == "export":

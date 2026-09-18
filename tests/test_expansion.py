@@ -30,6 +30,13 @@ class ExpansionWorkflowTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_capabilities_report_optional_runtime_without_claiming_findings(self):
+        capabilities = self.engine.capabilities()
+        self.assertIn("ffmpeg", capabilities)
+        self.assertIn("opencv", capabilities)
+        self.assertIn("status_without_model", capabilities["object"])
+        self.assertIn(capabilities["object"]["status_without_model"], {"not_configured", "available"})
+
     def test_acquisition_metadata_and_integrity_event(self):
         evidence = self.store.ingest_stream(
             self.case["id"],
@@ -46,6 +53,26 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertTrue(verification["valid"])
         self.assertTrue(any(event["action"] == "evidence_integrity_verified" for event in self.store.audit_events(self.case["id"])))
 
+    def test_supported_vendor_routes_are_exercised_on_realistic_raw_streams(self):
+        signatures = {
+            "hikvision": b"HIKVISION@HANGZHOU",
+            "dahua": b"DHFS",
+            "honeywell": b"HONEYWELL",
+            "cp_plus": b"CP PLUS",
+            "uniview": b"UNIVIEW",
+            "tp_link": b"TP-LINK",
+            "godrej": b"GODREJ",
+            "matrix": b"MATRIX",
+        }
+        stream = b"\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x01\x65idr"
+        for vendor, marker in signatures.items():
+            evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(marker + b"\0" + stream), f"{vendor}.bin")
+            identity = self.engine.identify(evidence["id"])
+            self.assertEqual(identity["primary_vendor"], vendor)
+            result = self.engine.recover(evidence["id"], "normal")
+            self.assertTrue(result["segments"], vendor)
+            self.assertTrue(all(item["end_offset"] <= len(marker + b"\0" + stream) for item in result["segments"]))
+
     def test_device_candidates_are_bounded_and_do_not_promote_magic(self):
         raw = b"model: NVR-5216-4KS2 firmware: V4.003.0000000.1.R\x00" + "Model: IPC-2CD2043".encode("utf-16le")
         path = Path(self.temp.name) / "metadata.bin"
@@ -55,6 +82,24 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertTrue(any("4.003" in item for item in result["firmware"]))
         self.assertNotIn("DHAV", result["models"])
         self.assertLessEqual(len(result["markers"]), 64)
+
+    def test_honeywell_custom_h264_header_is_parsed_with_timestamp(self):
+        payload = b"\x00\x00\x00\x01\x65real-h264-nal"
+        custom_header = (
+            bytes([0x82])
+            + b"\x80\x01\x00"
+            + struct.pack("<HHI", 1920, 1080, len(payload))
+            + struct.pack("<Q", 1704190800000000)
+        )
+        source = b"HONEYWELL model DVR-HNVR1 firmware V1.2.3" + custom_header + payload + b"\0" * 20
+        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(source), "honeywell.dd")
+        result = self.engine.recover(evidence["id"], "normal")
+        self.assertEqual(len(result["segments"]), 1)
+        segment = result["segments"][0]
+        self.assertEqual(segment["source"], "honeywell_custom_header")
+        self.assertEqual(segment["codec"], "H.264")
+        self.assertEqual(segment["start_time"], "2024-01-02T10:20:00.000000Z")
+        self.assertEqual(Path(export_segment(self.store, segment["id"], "media")["path"]).read_bytes(), payload)
 
     def test_dhav_payload_export_retains_native_source_range(self):
         payload = b"\x00\x00\x01\x67SPS\x00\x00\x01\x65FRAME"

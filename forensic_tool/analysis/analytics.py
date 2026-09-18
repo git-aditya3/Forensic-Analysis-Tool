@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,6 +19,29 @@ from ..storage import EvidenceStore, utc_now
 
 
 KINDS = {"motion", "object", "face"}
+
+
+def capabilities() -> Dict[str, Any]:
+    """Report optional runtime availability without probing evidence bytes."""
+    cv2, cv2_error = _load_cv2()
+    object_model = os.environ.get("SENTINEL_OBJECT_MODEL", "")
+    face_model = False
+    if cv2 is not None:
+        try:
+            face_model = Path(cv2.data.haarcascades, "haarcascade_frontalface_default.xml").is_file()
+        except AttributeError:
+            face_model = False
+    return {
+        "ffmpeg": {"available": bool(shutil.which("ffmpeg")), "path": shutil.which("ffmpeg")},
+        "opencv": {"available": cv2 is not None, "error": cv2_error},
+        "motion": {"available": cv2 is not None, "status_without_decoder": "not_configured" if cv2 is None else "available"},
+        "face": {"available": bool(cv2 is not None and face_model), "status_without_decoder": "not_configured" if not face_model else "available"},
+        "object": {
+            "available": bool(cv2 is not None and object_model and Path(object_model).is_file()),
+            "model_path_configured": bool(object_model),
+            "status_without_model": "not_configured",
+        },
+    }
 
 
 def _sha256(path: Path) -> str:

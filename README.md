@@ -30,8 +30,10 @@ operating system.
     sanity checks, followed by Annex-B carving when deeper recovery is chosen.
   - Hikvision: HIKVISION/HIKBTREE detection, MPEG program-stream pack leads,
     and raw Annex-B carving.
-  - Honeywell: signature routing, raw carving, and an explicit expired-index
-    lead when media bytes are adjacent.
+  - Honeywell: signature routing, bounded parsing of the documented custom
+    H.264 frame header (resolution, NAL length, Unix-microsecond timestamp),
+    raw carving, and explicit index/deletion limitations when channel metadata
+    is absent.
   - CP Plus, Uniview, TP-Link, Godrej, Matrix: signature-only routing to the
     generic recovery tier in this release.
 - **Bounded recovery postures** — indexed/normal, deleted, overwritten,
@@ -66,7 +68,7 @@ Python 3.10 or newer is the only runtime requirement.
 
 ```bash
 # Start the local workstation. Bind to 0.0.0.0 for a LAN/container preview.
-python3 -m forensic_tool serve --host 0.0.0.0 --port 8000 --data-dir data
+python3 -m forensic_tool --data-dir data serve --host 0.0.0.0 --port 8000
 ```
 
 Open <http://localhost:8000>. The browser workflow is:
@@ -81,6 +83,24 @@ Open <http://localhost:8000>. The browser workflow is:
 No source image is included in this repository. The tests use small in-memory
 byte fixtures; they are not claims of field validation against every recorder
 firmware variant.
+
+### SIH26150 controlled validation
+
+Run the reproducible end-to-end recorder-image emulator from the repository
+root:
+
+```bash
+python3 tools/sih26150_emulation.py
+```
+
+It creates a temporary evidence image containing a compact Annex-B H.264
+sequence inside common-layout DHAV frames, interleaves two channels, includes a
+malformed frame and raw deleted candidate, then verifies acquisition hashes,
+model/firmware candidates, all recovery postures, exact native/payload export,
+timestamps, custody, reporting, and explicit optional-analytics status. This
+is a regression gate for the workflow, not a substitute for an authorized
+physical image from a named DVR/NVR model. Field validation still requires
+real images and a configured decoder/model where decoded analytics are needed.
 
 ## CLI workflow
 
@@ -98,6 +118,7 @@ python3 -m forensic_tool --data-dir data timeline EVD-XXXXXXXXXXXX
 python3 -m forensic_tool --data-dir data correlate CASE-XXXXXXXXXX
 python3 -m forensic_tool --data-dir data verify EVD-XXXXXXXXXXXX
 python3 -m forensic_tool --data-dir data export SEG-XXXXXXXXXXXX --format media
+python3 -m forensic_tool --data-dir data capabilities
 python3 -m forensic_tool --data-dir data analytics SEG-XXXXXXXXXXXX --kind motion
 python3 -m forensic_tool --data-dir data report CASE-XXXXXXXXXX
 ```
@@ -112,7 +133,8 @@ The web server exposes a small JSON API used by the UI:
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Engine health/version |
+| `GET` | `/api/health` | Engine health/version and optional capability status |
+| `GET` | `/api/capabilities` | Decoder/model availability without fabricating findings |
 | `GET/POST` | `/api/cases` | List or create cases |
 | `GET` | `/api/cases/{case_id}` | Case bundle, evidence, findings, audit |
 | `POST` | `/api/cases/{case_id}/evidence` | Stream raw bytes; pass `X-Filename`, optional source-kind/sector query metadata |

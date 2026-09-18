@@ -50,6 +50,19 @@ def _iso_timestamp(value: int, milliseconds: bool = True) -> Optional[str]:
         return None
 
 
+def _unix_microseconds_to_iso(value: int) -> Optional[str]:
+    """Decode Honeywell's eight-byte Unix-microsecond frame timestamp."""
+    if value <= 0:
+        return None
+    seconds, microseconds = divmod(value, 1_000_000)
+    if seconds < 63072000 or seconds > 4102444800:  # 1972 .. 2100
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=microseconds).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _dhav_date_to_iso(date_value: int, milliseconds: int = 0) -> Optional[str]:
     """Decode the packed 32-bit DHAV date used by FFmpeg's demuxer."""
 
@@ -306,11 +319,15 @@ class HoneywellParser(BaseParser):
     route = "honeywell"
 
     def parse(self, reader: EvidenceReader, mode: str) -> List[Candidate]:
-        candidates = _carve_candidates(reader, mode)
+        custom = self._parse_custom_headers(reader, mode)
+        carves = _carve_candidates(reader, mode)
+        candidates = [*custom, *carves]
         # Expired index markers are useful evidence even when they don't expose
-        # a complete recording.  We only add a carve when media bytes are near
-        # it; a bare HONEYWELL string is not reported as a video segment.
+        # a complete recording. We only add a bounded lead when media bytes are
+        # near it; a bare HONEYWELL string is not reported as a video segment.
         for offset in reader.find_all(b"HONEYWELL", max_hits=64):
+            if any(item.start_offset <= offset < item.end_offset for item in custom):
+                continue
             nearby = reader.read_at(offset, min(1024 * 1024, reader.size - offset))
             if b"\x00\x00\x01" in nearby:
                 end = min(reader.size, offset + len(nearby))
@@ -325,7 +342,75 @@ class HoneywellParser(BaseParser):
                         notes="Honeywell marker is adjacent to media bytes; expiration/deletion semantics require device-specific validation.",
                     )
                 )
+        if custom and mode == "normal":
+            return _dedupe_candidates(custom)
         return _dedupe_candidates(candidates)
+
+    def _parse_custom_headers(self, reader: EvidenceReader, mode: str) -> List[Candidate]:
+        """Parse Honeywell's documented 20-byte custom H.264 frame header.
+
+        The real format uses a frame type byte (0x82 IDR / 0x02 non-IDR),
+        ``80 01 00``, two little-endian resolution values, a four-byte NAL
+        length, and an eight-byte Unix-microsecond timestamp. A six-byte Annex-B
+        prefix/header follows. This parser accepts only bounded, structurally
+        validated records and never treats a marker alone as a frame.
+        """
+        markers = sorted(set(
+            reader.find_all(b"\x82\x80\x01\x00", max_hits=100_000)
+            + reader.find_all(b"\x02\x80\x01\x00", max_hits=100_000)
+        ))
+        state = {
+            "normal": "indexed",
+            "deleted": "deleted_candidate",
+            "overwritten": "overwritten_candidate",
+            "fragmented": "fragment",
+            "lost_corrupted": "fragment",
+            "unallocated": "unallocated_candidate",
+        }.get(mode, "indexed")
+        candidates: List[Candidate] = []
+        for offset in markers:
+            header = reader.read_at(offset, 20)
+            if len(header) < 20:
+                continue
+            frame_type = header[0]
+            width, height = struct.unpack_from("<HH", header, 4)
+            nal_length = struct.unpack_from("<I", header, 8)[0]
+            timestamp = struct.unpack_from("<Q", header, 12)[0]
+            payload_offset = offset + 20
+            prefix = reader.read_at(payload_offset, 6)
+            if not (prefix.startswith(b"\x00\x00\x00\x01") or prefix.startswith(b"\x00\x00\x01")):
+                continue
+            if not (16 <= width <= 16384 and 16 <= height <= 16384):
+                continue
+            if not (1 <= nal_length <= min(256 * 1024 * 1024, reader.size - payload_offset)):
+                continue
+            end = payload_offset + nal_length
+            if end > reader.size:
+                continue
+            # If the declared record ends before the next custom header, keep
+            # the exact declared range. Any inter-record delimiter belongs to
+            # the container, not this media payload.
+            timestamp_value = _unix_microseconds_to_iso(timestamp)
+            candidates.append(
+                Candidate(
+                    start_offset=offset,
+                    end_offset=end,
+                    source="honeywell_custom_header",
+                    state=state,
+                    codec="H.264",
+                    confidence=0.94 if timestamp_value else 0.84,
+                    channel=None,
+                    start_time=timestamp_value,
+                    payload_start_offset=payload_offset,
+                    payload_end_offset=end,
+                    notes=(
+                        f"Honeywell custom H.264 header validated: frame type 0x{frame_type:02X}, "
+                        f"{width}x{height}, declared NAL length {nal_length}. "
+                        "Channel assignment requires a corroborating Video Channel List entry."
+                    ),
+                )
+            )
+        return candidates
 
 
 class GenericParser(BaseParser):
