@@ -24,6 +24,10 @@ def _suffix_for(codec: str) -> str:
         "MPEG-PS": ".mpg",
         "DHAV": ".dav",
         "DHAV-audio": ".audio",
+        "MP4": ".mp4",
+        "AVI": ".avi",
+        "Matroska": ".mkv",
+        "MPEG-TS": ".ts",
     }.get(codec, ".bin")
 
 
@@ -226,4 +230,8 @@ def _content_type(suffix: str) -> str:
         ".mpg": "video/mpeg",
         ".dav": "application/octet-stream",
         ".audio": "application/octet-stream",
+        ".mp4": "video/mp4",
+        ".avi": "video/x-msvideo",
+        ".mkv": "video/x-matroska",
+        ".ts": "video/mp2t",
     }.get(suffix, "application/octet-stream")

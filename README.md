@@ -47,7 +47,9 @@ operating system.
   physical-range SHA-256, and limitations.
 - **Native and demuxed evidence export** — copies the exact source range and,
   where a parser provides offsets, the exact container payload range without
-  transcoding. MP4 remuxing and analytics decoding use a system FFmpeg when
+  transcoding. Common ISO-BMFF/MP4, AVI/RIFF, Matroska/WebM, and MPEG-TS
+  structures are bounded before export instead of being treated as arbitrary
+  raw bytes. MP4 remuxing and analytics decoding use a system FFmpeg when
   present or the packaged `imageio-ffmpeg` fallback; native and payload
   artifacts are retained, hashed, and logged.
 - **Timestamp/correlation workflow** — normalizes known timestamps to UTC with

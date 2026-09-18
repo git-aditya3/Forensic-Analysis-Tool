@@ -162,6 +162,25 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertTrue(verification["valid"])
         self.assertTrue(any(event["action"] == "evidence_integrity_verified" for event in self.store.audit_events(self.case["id"])))
 
+    def test_common_media_containers_are_bounded_and_exportable(self):
+        ftyp = struct.pack(">I", 16) + b"ftyp" + b"isom" + b"\x00\x00\x00\x01"
+        mdat = struct.pack(">I", 13) + b"mdat" + b"frame"
+        mp4_source = ftyp + mdat
+        mp4_evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(mp4_source), "clip.mp4")
+        mp4_recovery = self.engine.recover(mp4_evidence["id"])
+        self.assertEqual(mp4_recovery["segments"][0]["codec"], "MP4")
+        self.assertEqual(mp4_recovery["segments"][0]["source"], "mp4_box_parser")
+        mp4_export = export_segment(self.store, mp4_recovery["segments"][0]["id"], "media")
+        self.assertEqual(Path(mp4_export["path"]).read_bytes(), mp4_source)
+        self.assertEqual(mp4_export["content_type"], "video/mp4")
+
+        avi_body = b"AVI " + b"LIST" + struct.pack("<I", 4) + b"data"
+        avi_source = b"RIFF" + struct.pack("<I", len(avi_body)) + avi_body
+        avi_evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(avi_source), "clip.avi")
+        avi_recovery = self.engine.recover(avi_evidence["id"])
+        self.assertEqual(avi_recovery["segments"][0]["codec"], "AVI")
+        self.assertEqual(avi_recovery["segments"][0]["end_offset"], len(avi_source))
+
     def test_supported_vendor_routes_are_exercised_on_realistic_raw_streams(self):
         signatures = {
             "hikvision": b"HIKVISION@HANGZHOU",

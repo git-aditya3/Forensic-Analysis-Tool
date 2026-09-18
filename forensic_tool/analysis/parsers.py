@@ -139,11 +139,188 @@ def _carve_candidates(reader: EvidenceReader, mode: str) -> List[Candidate]:
     return candidates
 
 
+def _recovery_state(mode: str, normal: str = "indexed") -> str:
+    return {
+        "normal": normal,
+        "deleted": "deleted_candidate",
+        "overwritten": "overwritten_candidate",
+        "fragmented": "fragment",
+        "lost_corrupted": "fragment",
+        "unallocated": "unallocated_candidate",
+    }.get(mode, normal)
+
+
+def _container_candidate(
+    start: int,
+    end: int,
+    source: str,
+    codec: str,
+    mode: str,
+    confidence: float,
+    notes: str,
+) -> Candidate:
+    return Candidate(
+        start_offset=start,
+        end_offset=end,
+        source=source,
+        state=_recovery_state(mode),
+        codec=codec,
+        confidence=confidence if mode == "normal" else min(confidence, 0.72),
+        payload_start_offset=start,
+        payload_end_offset=end,
+        notes=notes,
+    )
+
+
+def _parse_iso_bmff(reader: EvidenceReader, mode: str) -> List[Candidate]:
+    """Recognise bounded ISO-BMFF/MP4 top-level boxes without transcoding."""
+    candidates: List[Candidate] = []
+    for ftyp_offset in reader.find_all(b"ftyp", max_hits=128):
+        start = ftyp_offset - 4
+        if start < 0:
+            continue
+        header = reader.read_at(start, 16)
+        if len(header) < 8 or header[4:8] != b"ftyp":
+            continue
+        first_size = struct.unpack_from(">I", header, 0)[0]
+        if first_size < 16 or start + first_size > reader.size:
+            continue
+        cursor = start
+        has_media = False
+        boxes = 0
+        while cursor + 8 <= reader.size and boxes < 100_000:
+            box_header = reader.read_at(cursor, 16)
+            if len(box_header) < 8:
+                break
+            box_size = struct.unpack_from(">I", box_header, 0)[0]
+            box_type = box_header[4:8]
+            header_size = 8
+            if box_size == 1:
+                if len(box_header) < 16:
+                    break
+                box_size = struct.unpack_from(">Q", box_header, 8)[0]
+                header_size = 16
+            elif box_size == 0:
+                box_size = reader.size - cursor
+            if box_size < header_size or box_size > reader.size - cursor:
+                break
+            if box_type in {b"mdat", b"moov", b"moof"}:
+                has_media = True
+            cursor += box_size
+            boxes += 1
+            if cursor >= reader.size:
+                break
+        if boxes >= 2 and has_media and cursor > start:
+            candidates.append(_container_candidate(
+                start,
+                cursor,
+                "mp4_box_parser",
+                "MP4",
+                mode,
+                0.94,
+                "ISO-BMFF ftyp plus media box structure validated; no recorder timestamp was inferred from container bytes.",
+            ))
+    return _dedupe_candidates(candidates)
+
+
+def _parse_avi_riff(reader: EvidenceReader, mode: str) -> List[Candidate]:
+    candidates: List[Candidate] = []
+    for offset in reader.find_all(b"RIFF", max_hits=128):
+        header = reader.read_at(offset, 12)
+        if len(header) < 12 or header[8:12] not in {b"AVI ", b"AVIX"}:
+            continue
+        declared_size = struct.unpack_from("<I", header, 4)[0]
+        if declared_size < 4 or declared_size > reader.size - offset - 8:
+            continue
+        end = offset + 8 + declared_size
+        candidates.append(_container_candidate(
+            offset,
+            end,
+            "avi_riff_parser",
+            "AVI",
+            mode,
+            0.90,
+            "RIFF AVI container signature and bounded little-endian length validated; media timestamps remain decoder/container dependent.",
+        ))
+    return _dedupe_candidates(candidates)
+
+
+def _parse_matroska(reader: EvidenceReader, mode: str) -> List[Candidate]:
+    candidates: List[Candidate] = []
+    marker = b"\x1A\x45\xDF\xA3"
+    for offset in reader.find_all(marker, max_hits=64):
+        header = reader.read_at(offset, min(4096, reader.size - offset))
+        if b"matroska" not in header.lower() and b"webm" not in header.lower():
+            continue
+        candidates.append(_container_candidate(
+            offset,
+            reader.size,
+            "matroska_ebml_parser",
+            "Matroska",
+            mode,
+            0.82,
+            "EBML header and Matroska/WebM document marker validated; the bounded candidate ends at the acquired source tail.",
+        ))
+    return _dedupe_candidates(candidates)
+
+
+def _parse_mpeg_ts(reader: EvidenceReader, mode: str) -> List[Candidate]:
+    """Find repeated 188-byte MPEG-TS sync packets, not isolated 0x47 bytes."""
+    sync_offsets: List[int] = []
+    possible = reader.find_all(b"\x47", max_hits=200_000)
+    checks = reader.read_many((offset + 188 * step for offset in possible for step in range(1, 5)), 1)
+    for offset in possible:
+        if all(checks.get(offset + 188 * step, b"") == b"\x47" for step in range(1, 5)):
+            sync_offsets.append(offset)
+    if not sync_offsets:
+        return []
+    candidates: List[Candidate] = []
+    group: List[int] = []
+    for offset in sync_offsets:
+        if group and offset - group[-1] != 188:
+            if len(group) >= 3:
+                candidates.append(_container_candidate(
+                    group[0],
+                    group[-1] + 188,
+                    "mpeg_ts_sync_parser",
+                    "MPEG-TS",
+                    mode,
+                    0.86,
+                    "Repeated 188-byte MPEG transport-stream sync packets validated; no wall-clock timestamp was inferred.",
+                ))
+            group = []
+        group.append(offset)
+    if len(group) >= 3:
+        candidates.append(_container_candidate(
+            group[0],
+            group[-1] + 188,
+            "mpeg_ts_sync_parser",
+            "MPEG-TS",
+            mode,
+            0.86,
+            "Repeated 188-byte MPEG transport-stream sync packets validated; no wall-clock timestamp was inferred.",
+        ))
+    return _dedupe_candidates(candidates)
+
+
+def _parse_common_containers(reader: EvidenceReader, mode: str) -> List[Candidate]:
+    candidates = [
+        *_parse_iso_bmff(reader, mode),
+        *_parse_avi_riff(reader, mode),
+        *_parse_matroska(reader, mode),
+        *_parse_mpeg_ts(reader, mode),
+    ]
+    return _dedupe_candidates(candidates)
+
+
 class BaseParser:
     route = "generic_tier2"
 
     def parse(self, reader: EvidenceReader, mode: str) -> List[Candidate]:
-        return _carve_candidates(reader, mode)
+        containers = _parse_common_containers(reader, mode)
+        if containers and mode == "normal":
+            return containers
+        return _dedupe_candidates([*containers, *_carve_candidates(reader, mode)])
 
 
 class DahuaParser(BaseParser):
