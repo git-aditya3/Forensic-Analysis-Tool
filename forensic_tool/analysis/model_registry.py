@@ -114,6 +114,48 @@ def describe_model(spec: ModelSpec, *, auto_download: bool = True) -> Dict[str, 
     return _metadata(spec, None, "auto_download_on_use" if auto_download else "offline_fallback")
 
 
+def verify_model_file(spec: ModelSpec, candidate: str | Path) -> tuple[Optional[Path], Dict[str, Any]]:
+    """Verify an examiner-supplied path against a pinned model specification.
+
+    A readable ONNX file is not automatically a compatible detector.  Callers
+    must use this function before allowing a configured path to produce
+    findings; a model that merely exists, parses, or returns a tensor is not
+    enough to establish provenance or detector compatibility.
+    """
+    path = Path(candidate).expanduser()
+    if not path.is_file():
+        return None, _metadata(spec, path, "not_configured", error="Configured model file was not found.")
+    try:
+        actual_size = path.stat().st_size
+        actual_hash = _sha256(path) if actual_size == spec.size else ""
+    except OSError as error:
+        return None, _metadata(spec, path, "unavailable", error=f"Configured model could not be read: {error}")
+    if actual_size == spec.size and actual_hash == spec.sha256:
+        return path.resolve(), _metadata(spec, path.resolve(), "available", actual_sha256=actual_hash, configured=True)
+    return None, _metadata(
+        spec,
+        path,
+        "invalid",
+        actual_size=actual_size,
+        actual_sha256=actual_hash or None,
+        error="Configured model failed the pinned size or SHA-256 check; it was not used.",
+    )
+
+
+def provision_default_models(store_root: str | Path, *, auto_download: Optional[bool] = None) -> Dict[str, Dict[str, Any]]:
+    """Verify or provision every built-in analytics model in one preflight.
+
+    The command-line preflight is useful for a connected lab that will later
+    operate offline. It returns provenance for both success and failure and
+    never places model bytes inside acquired evidence.
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+    for spec in (OBJECT_MODEL, FACE_MODEL):
+        _path, provenance = resolve_model(spec, store_root, auto_download=auto_download)
+        results[spec.key] = provenance
+    return results
+
+
 def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Optional[bool] = None) -> tuple[Optional[Path], Dict[str, Any]]:
     """Return a verified model path, lazily downloading it when permitted."""
     root = model_directory(store_root)
@@ -122,18 +164,10 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
         auto_download = _env_flag("SENTINEL_AUTO_DOWNLOAD_MODELS", True)
     invalid_cache: Optional[Dict[str, Any]] = None
     if path.is_file():
-        actual_size = path.stat().st_size
-        actual_hash = _sha256(path) if actual_size == spec.size else ""
-        if actual_size == spec.size and actual_hash == spec.sha256:
-            return path, _metadata(spec, path, "available", actual_sha256=actual_hash)
-        invalid_cache = _metadata(
-            spec,
-            path,
-            "invalid",
-            actual_size=actual_size,
-            actual_sha256=actual_hash or None,
-            error="Cached model failed the expected size or SHA-256 check; it was not used.",
-        )
+        verified_path, cached_status = verify_model_file(spec, path)
+        if verified_path is not None:
+            return verified_path, cached_status
+        invalid_cache = dict(cached_status, error="Cached model failed the expected size or SHA-256 check; it was not used.")
         if not auto_download:
             return None, invalid_cache
 

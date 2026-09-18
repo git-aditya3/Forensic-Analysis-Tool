@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from forensic_tool.analysis.analytics import _process_frames, run_analytics
-from forensic_tool.analysis.model_registry import ModelSpec, OBJECT_MODEL, resolve_model
+from forensic_tool.analysis.model_registry import ModelSpec, OBJECT_MODEL, provision_default_models, resolve_model, verify_model_file
 from forensic_tool.analysis.device import identify_device
 from forensic_tool.analysis.engine import AnalysisEngine
 from forensic_tool.analysis.timeline import build_timeline, normalize_timestamp
@@ -47,6 +47,12 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertIn("status_without_model", capabilities["object"])
         self.assertIn(capabilities["object"]["status_without_model"], {"not_configured", "available"})
 
+    def test_model_preflight_reports_both_pinned_assets_without_network(self):
+        results = provision_default_models(self.root, auto_download=False)
+        self.assertEqual(set(results), {"opencv-zoo-nanodet-coco", "opencv-zoo-yunet-face"})
+        self.assertTrue(all(item["status"] == "not_configured" for item in results.values()))
+        self.assertTrue(all(item["expected_sha256"] for item in results.values()))
+
     def test_verified_model_registry_never_uses_a_corrupt_cache(self):
         model_path = self.root / "models" / OBJECT_MODEL.filename
         model_path.parent.mkdir(parents=True)
@@ -55,6 +61,21 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertIsNone(resolved)
         self.assertEqual(provenance["status"], "invalid")
         self.assertEqual(provenance["expected_sha256"], OBJECT_MODEL.sha256)
+
+    def test_configured_model_must_match_a_pinned_detector_asset(self):
+        candidate = Path(self.temp.name) / "arbitrary.onnx"
+        candidate.write_bytes(b"a readable but unapproved model")
+        resolved, provenance = verify_model_file(OBJECT_MODEL, candidate)
+        self.assertIsNone(resolved)
+        self.assertEqual(provenance["status"], "invalid")
+        self.assertIn("not used", provenance["error"])
+
+        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(b"\x00\x00\x01\x65frame"), "raw.bin")
+        recovered = self.engine.recover(evidence["id"])
+        result = run_analytics(self.store, recovered["segments"][0]["id"], "object", str(candidate))
+        self.assertIn(result["status"], {"not_configured", "unsupported"})
+        self.assertEqual(result["findings"]["items"], [])
+        self.assertEqual(result["findings"]["validation"]["status"], "not_validated")
 
     def test_model_provision_is_atomic_and_hash_verified(self):
         payload = b"verified-model-bytes"
@@ -261,11 +282,17 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertEqual(motion["status"], "complete")
         self.assertGreater(len(motion["findings"]["items"]), 0)
         self.assertEqual(motion["findings"]["decoder"], "opencv")
+        self.assertIn("nms", motion["findings"])
+        self.assertEqual(motion["findings"]["validation"]["status"], "complete")
         self.assertEqual(people["status"], "complete")
         self.assertIn(people["findings"]["runtime"], {"opencv-hog-person", "opencv-dnn-nanodet-coco"})
+        self.assertIn("nms", people["findings"])
+        self.assertEqual(people["findings"]["validation"]["status"], "complete")
         self.assertEqual(faces["status"], "complete")
         self.assertEqual(faces["findings"]["frames_examined"], 10)
         self.assertIn(faces["findings"]["detector"], {"opencv-haar", "opencv-yunet"})
+        self.assertIn("nms", faces["findings"])
+        self.assertEqual(faces["findings"]["validation"]["status"], "complete")
         mp4 = export_segment(self.store, segment.id, "mp4")
         self.assertGreater(mp4["size"], 0)
         self.assertIn("ffmpeg", mp4["note"].lower())

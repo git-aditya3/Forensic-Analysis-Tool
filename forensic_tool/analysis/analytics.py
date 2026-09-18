@@ -12,7 +12,6 @@ HOG, and frame-difference fallbacks rather than fabricating semantic findings.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shutil
@@ -22,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..exporter import ExportError, export_segment
 from ..storage import EvidenceStore, utc_now
-from .model_registry import COCO_LABELS, FACE_MODEL, OBJECT_MODEL, describe_model, resolve_model
+from .model_registry import COCO_LABELS, FACE_MODEL, OBJECT_MODEL, describe_model, resolve_model, verify_model_file
 
 
 KINDS = {"motion", "object", "face"}
@@ -50,15 +49,18 @@ def _ffmpeg_info() -> Dict[str, Any]:
 
 
 def capabilities() -> Dict[str, Any]:
-    """Report runtime availability without probing or modifying evidence."""
+    """Report runtime availability without probing acquired evidence."""
     cv2, cv2_error = _load_cv2()
     object_model = os.environ.get("SENTINEL_OBJECT_MODEL", "")
-    face_model = False
+    face_model_path = os.environ.get("SENTINEL_FACE_MODEL", "")
+    configured_object = verify_model_file(OBJECT_MODEL, object_model)[1] if object_model else None
+    configured_face = verify_model_file(FACE_MODEL, face_model_path)[1] if face_model_path else None
+    haar_model = False
     if cv2 is not None:
         try:
-            face_model = Path(cv2.data.haarcascades, "haarcascade_frontalface_default.xml").is_file()
+            haar_model = Path(cv2.data.haarcascades, "haarcascade_frontalface_default.xml").is_file()
         except AttributeError:
-            face_model = False
+            haar_model = False
     ffmpeg = _ffmpeg_info()
     auto_models = _env_flag("SENTINEL_AUTO_DOWNLOAD_MODELS", True)
     return {
@@ -70,21 +72,23 @@ def capabilities() -> Dict[str, Any]:
             "decoders": [name for name, available in (("opencv", cv2 is not None), ("ffmpeg", ffmpeg["available"])) if available],
         },
         "face": {
-            "available": bool(cv2 is not None and face_model),
-            "runtime": "opencv-haar-fallback" if face_model else None,
+            "available": bool(cv2 is not None and (haar_model or configured_face and configured_face.get("status") == "available")),
+            "runtime": "opencv-yunet-configured-verified" if configured_face and configured_face.get("status") == "available" else "opencv-haar-fallback" if haar_model else None,
             "default_model": FACE_MODEL.key,
             "default_model_auto_download": auto_models,
             "default_model_provenance": describe_model(FACE_MODEL, auto_download=auto_models),
-            "status_without_decoder": "not_configured" if not face_model else "available",
+            "configured_model_provenance": configured_face,
+            "status_without_decoder": "not_configured" if not haar_model and not configured_face else "available",
         },
         "object": {
             "available": cv2 is not None,
-            "runtime": "opencv-dnn-configured" if object_model and Path(object_model).is_file() else "opencv-dnn-nanodet-auto" if cv2 is not None else None,
+            "runtime": "opencv-dnn-nanodet-configured-verified" if configured_object and configured_object.get("status") == "available" else "opencv-dnn-nanodet-auto" if cv2 is not None else None,
             "fallback_runtime": "opencv-hog-person" if cv2 is not None else None,
             "classes": list(COCO_LABELS) if cv2 is not None else [],
             "default_model": OBJECT_MODEL.key,
             "default_model_auto_download": auto_models,
             "default_model_provenance": describe_model(OBJECT_MODEL, auto_download=auto_models),
+            "configured_model_provenance": configured_object,
             "model_path_configured": bool(object_model),
             "status_without_model": "available" if cv2 is not None else "not_configured",
         },
@@ -96,14 +100,6 @@ def _env_flag(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _base_result(store: EvidenceStore, segment_id: str, kind: str, model: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -141,6 +137,16 @@ def _finish(result: Dict[str, Any], status: str, notes: str = "") -> Dict[str, A
     result["status"] = status
     result["completed_at"] = utc_now()
     result["notes"] = notes
+    findings = result.setdefault("findings", {})
+    source_range = findings.get("source_range") or {}
+    media_artifact = findings.get("media_artifact") or {}
+    findings["validation"] = {
+        "status": "complete" if status == "complete" else "not_validated",
+        "source_range_sha256": "recorded" if source_range.get("sha256") else "missing",
+        "media_artifact_sha256": "recorded" if media_artifact.get("sha256") else "missing",
+        "read_only_evidence": True,
+        "no_identity_claim": result.get("kind") == "face",
+    }
     return result
 
 
@@ -380,22 +386,36 @@ def _run_motion(result: Dict[str, Any], media_path: Path, cv2: Any) -> Dict[str,
                     regions.append({"bbox": [x, y, width, height], "area": round(area, 2)})
                 items.append({
                     "frame": frame_index,
+                    "label": "frame_change",
+                    "confidence": None,
                     "score": round(score, 4),
                     "type": "frame_change",
                     "regions": regions[:50],
+                    "validation": {
+                        "bbox": "motion_regions_if_present",
+                        "model": "frame_difference",
+                        "identity": "not_inferred",
+                    },
                 })
         previous = gray
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    if count == 0:
-        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
     result["findings"].update({
         "frames_examined": count,
         "items": items,
         "threshold": 12.0,
         "decoder": decoder,
+        "nms": {
+            "applied": False,
+            "method": "frame-difference contours",
+            "reason": "Motion regions are change indicators, not object detections.",
+        },
     })
-    return _finish(result, "complete", _decode_note(decoder, error) + " Motion remains a frame-change signal; no semantic object identity is inferred.")
+    if count == 0:
+        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
+    if error:
+        return _finish(result, "unsupported", f"Decoder returned only a partial/invalid stream after {count} frame(s): {error}")
+    return _finish(result, "complete", "Frames decoded with the selected runtime. Motion remains a frame-change signal; no semantic object identity is inferred.")
 
 
 def _letterbox(image: Any, cv2: Any, target: int = 416) -> Tuple[Any, Tuple[int, int, int, int]]:
@@ -487,11 +507,18 @@ def _nanodet_predictions(cv2: Any, net: Any, frame: Any) -> List[Dict[str, Any]]
             "label": COCO_LABELS[class_id] if class_id < len(COCO_LABELS) else f"class_{class_id}",
             "confidence": round(scores[index], 4),
             "bbox": [x1, y1, x2 - x1, y2 - y1],
+            "validation": {
+                "bbox": "clamped_to_decoded_frame",
+                "model": "pinned_sha256_verified",
+                "identity": "not_inferred",
+            },
         })
     return findings
 
 
 def _run_nanodet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: Path, provenance: Dict[str, Any]) -> Dict[str, Any]:
+    result["model"] = str(model_path)
+    result["findings"]["model_provenance"] = provenance
     try:
         net = cv2.dnn.readNet(str(model_path))
     except Exception as error:
@@ -503,8 +530,6 @@ def _run_nanodet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path:
             items.append(dict(item, frame=frame_index))
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    if count == 0:
-        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
     result["model"] = str(model_path)
     result["findings"].update({
         "frames_examined": count,
@@ -513,7 +538,17 @@ def _run_nanodet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path:
         "model_path": str(model_path),
         "model_provenance": provenance,
         "decoder": decoder,
+        "nms": {
+            "applied": True,
+            "method": "opencv.dnn.NMSBoxes",
+            "score_threshold": 0.35,
+            "iou_threshold": 0.60,
+        },
     })
+    if count == 0:
+        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
+    if error:
+        return _finish(result, "unsupported", f"Decoder/model returned only a partial/invalid stream after {count} frame(s): {error}")
     return _finish(result, "complete", _decode_note(decoder, error) + " Default NanoDet covers the COCO object classes; detections are not identity claims.")
 
 
@@ -538,6 +573,10 @@ def _run_hog(result: Dict[str, Any], media_path: Path, cv2: Any, model_status: O
         boxes, weights = hog.detectMultiScale(detector_frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
         for box, weight in zip(boxes, weights):
             x, y, box_width, box_height = [int(round(value / scale)) for value in box]
+            x = max(0, min(width - 1, x))
+            y = max(0, min(height - 1, y))
+            box_width = max(1, min(width - x, box_width))
+            box_height = max(1, min(height - y, box_height))
             confidence = float(weight[0] if hasattr(weight, "__len__") else weight)
             items.append({
                 "frame": frame_index,
@@ -545,11 +584,14 @@ def _run_hog(result: Dict[str, Any], media_path: Path, cv2: Any, model_status: O
                 "label": "person",
                 "confidence": round(confidence, 4),
                 "bbox": [x, y, box_width, box_height],
+                "validation": {
+                    "bbox": "clamped_to_decoded_frame",
+                    "model": "opencv_builtin_hog",
+                    "identity": "not_inferred",
+                },
             })
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    if count == 0:
-        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
     result["findings"].update({
         "frames_examined": count,
         "items": items,
@@ -557,94 +599,36 @@ def _run_hog(result: Dict[str, Any], media_path: Path, cv2: Any, model_status: O
         "model_path": None,
         "decoder": decoder,
         "extended_model": model_status,
+        "nms": {
+            "applied": False,
+            "method": "opencv.HOGDescriptor.detectMultiScale grouping",
+            "reason": "The built-in people fallback exposes grouped detections rather than a class-agnostic NMS pass.",
+        },
     })
+    if count == 0:
+        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
+    if error:
+        return _finish(result, "unsupported", f"Decoder returned only a partial/invalid stream after {count} frame(s): {error}")
     note = _decode_note(decoder, error) + " Offline fallback detects people only."
     if model_status and model_status.get("error"):
         note += f" Extended COCO model was not used: {model_status['error']}"
     return _finish(result, "complete", note)
 
 
-def _run_custom_object(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: Path) -> Dict[str, Any]:
-    try:
-        net = cv2.dnn.readNetFromONNX(str(model_path))
-    except Exception as error:
-        return _finish(result, "unsupported", f"Configured object model could not be loaded by OpenCV DNN: {error}")
-    labels = []
-    labels_path = os.environ.get("SENTINEL_OBJECT_LABELS", "")
-    if labels_path and Path(labels_path).is_file():
-        labels = [line.strip() for line in Path(labels_path).read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-    items: List[Dict[str, Any]] = []
-
-    def process(frame_index: int, frame: Any) -> None:
-        height, width = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (640, 640), swapRB=True, crop=False)
-        net.setInput(blob)
-        output = net.forward()
-        if not hasattr(output, "shape") or len(output.shape) < 2:
-            raise ValueError("Configured object model returned an unsupported output tensor")
-        rows = output.reshape(-1, output.shape[-1])
-        boxes: List[List[int]] = []
-        scores: List[float] = []
-        classes: List[int] = []
-        for row in rows:
-            if len(row) < 6:
-                continue
-            objectness = float(row[4]) if len(row) > 6 else 1.0
-            class_offset = 5 if len(row) > 6 else 4
-            class_index = class_offset
-            class_score = float(row[class_offset])
-            for index in range(class_offset, len(row)):
-                value = float(row[index])
-                if value > class_score:
-                    class_score, class_index = value, index
-            score = objectness * class_score
-            if score < 0.35:
-                continue
-            center_x, center_y, box_width, box_height = [float(value) for value in row[:4]]
-            if max(abs(center_x), abs(center_y), abs(box_width), abs(box_height)) <= 2:
-                center_x, box_width = center_x * width, box_width * width
-                center_y, box_height = center_y * height, box_height * height
-            x = max(0, int(center_x - box_width / 2))
-            y = max(0, int(center_y - box_height / 2))
-            w = min(width - x, max(1, int(box_width)))
-            h = min(height - y, max(1, int(box_height)))
-            boxes.append([x, y, w, h])
-            scores.append(float(score))
-            classes.append(max(0, class_index - class_offset))
-        selected = cv2.dnn.NMSBoxes(boxes, scores, 0.35, 0.45) if boxes else []
-        for selected_index in selected:
-            index = int(selected_index[0]) if hasattr(selected_index, "__len__") else int(selected_index)
-            class_id = classes[index]
-            items.append({
-                "frame": frame_index,
-                "class_id": class_id,
-                "label": labels[class_id] if class_id < len(labels) else f"class_{class_id}",
-                "confidence": round(scores[index], 4),
-                "bbox": boxes[index],
-            })
-
-    count, decoder, error = _process_frames(cv2, media_path, process)
-    if count == 0:
-        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
-    result["model"] = str(model_path)
-    result["findings"].update({
-        "frames_examined": count,
-        "items": items,
-        "runtime": "opencv-dnn-configured",
-        "model_path": str(model_path),
-        "model_sha256": _sha256(model_path),
-        "decoder": decoder,
-    })
-    return _finish(result, "complete", _decode_note(decoder, error) + " Object labels depend on the configured ONNX model and optional label file.")
-
-
 def _run_object(result: Dict[str, Any], store_root: Path, media_path: Path, cv2: Any, model: str) -> Dict[str, Any]:
     model_path_text = model or os.environ.get("SENTINEL_OBJECT_MODEL", "")
     if model_path_text:
-        model_path = Path(model_path_text).expanduser()
-        if not model_path.is_file():
-            return _finish(result, "not_configured", f"Configured object model was not found: {model_path}")
-        return _run_custom_object(result, media_path, cv2, model_path)
+        # Do not treat an arbitrary readable ONNX file as a detector.  The
+        # only supported configured object model is the same pinned NanoDet
+        # asset used by automatic provisioning; this keeps labels, tensor
+        # decoding, and model provenance bound to one known architecture.
+        model_path, provenance = verify_model_file(OBJECT_MODEL, model_path_text)
+        result["model"] = model_path_text
+        result["findings"]["model_provenance"] = provenance
+        if model_path is None:
+            status = "unsupported" if provenance.get("status") == "invalid" else "not_configured"
+            return _finish(result, status, str(provenance.get("error", "Configured object model was not verified")))
+        return _run_nanodet(result, media_path, cv2, model_path, provenance)
 
     default_path, provenance = resolve_model(OBJECT_MODEL, store_root)
     if default_path is not None:
@@ -658,6 +642,8 @@ def _run_object(result: Dict[str, Any], store_root: Path, media_path: Path, cv2:
 
 
 def _run_yunet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: Path, provenance: Dict[str, Any]) -> Dict[str, Any]:
+    result["model"] = str(model_path)
+    result["findings"]["model_provenance"] = provenance
     if not hasattr(cv2, "FaceDetectorYN_create"):
         return _finish(result, "unsupported", "This OpenCV build does not expose the YuNet face detector")
     try:
@@ -677,16 +663,20 @@ def _run_yunet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: P
             x, y, box_width, box_height = [int(round(value)) for value in values[:4]]
             items.append({
                 "frame": frame_index,
+                "label": "face",
                 "face_index": f"face-{frame_index:06d}-{face_index:02d}",
                 "bbox": [x, y, box_width, box_height],
                 "landmarks": [[round(values[index], 2), round(values[index + 1], 2)] for index in range(4, min(14, len(values) - 1), 2)],
                 "confidence": round(values[-1], 4),
                 "identity": None,
+                "validation": {
+                    "bbox": "detector_output",
+                    "model": "pinned_sha256_verified",
+                    "identity": "not_performed",
+                },
             })
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    if count == 0:
-        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
     result["model"] = str(model_path)
     result["findings"].update({
         "frames_examined": count,
@@ -695,7 +685,18 @@ def _run_yunet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: P
         "model_path": str(model_path),
         "model_provenance": provenance,
         "decoder": decoder,
+        "nms": {
+            "applied": True,
+            "method": "OpenCV FaceDetectorYN",
+            "score_threshold": 0.6,
+            "iou_threshold": 0.3,
+            "top_k": 5000,
+        },
     })
+    if count == 0:
+        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
+    if error:
+        return _finish(result, "unsupported", f"Decoder/model returned only a partial/invalid stream after {count} frame(s): {error}")
     return _finish(result, "complete", _decode_note(decoder, error) + " Faces are indexed as detections only; no person identity or biometric match is asserted.")
 
 
@@ -718,21 +719,36 @@ def _run_haar(result: Dict[str, Any], media_path: Path, cv2: Any, model: str, pr
         for face_index, (x, y, width, height) in enumerate(faces):
             items.append({
                 "frame": frame_index,
+                "label": "face",
                 "face_index": f"face-{frame_index:06d}-{face_index:02d}",
                 "bbox": [int(x), int(y), int(width), int(height)],
+                "confidence": None,
                 "identity": None,
+                "validation": {
+                    "bbox": "opencv_cascade_output",
+                    "model": "opencv_bundled_haar",
+                    "identity": "not_performed",
+                },
             })
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    if count == 0:
-        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
     result["findings"].update({
         "frames_examined": count,
         "items": items,
         "detector": model or "opencv-haar",
         "decoder": decoder,
         "default_model": provenance,
+        "model_provenance": provenance,
+        "nms": {
+            "applied": False,
+            "method": "opencv.CascadeClassifier.detectMultiScale",
+            "reason": "Haar fallback is a detector-only index; no separate NMS result is claimed.",
+        },
     })
+    if count == 0:
+        return _finish(result, "unsupported", error or "No configured decoder could return a frame")
+    if error:
+        return _finish(result, "unsupported", f"Decoder returned only a partial/invalid stream after {count} frame(s): {error}")
     note = _decode_note(decoder, error) + " Faces are indexed as detections only; no person identity or biometric match is asserted."
     if provenance and provenance.get("error"):
         note += f" Higher-accuracy YuNet model was not used: {provenance['error']}"
@@ -740,13 +756,18 @@ def _run_haar(result: Dict[str, Any], media_path: Path, cv2: Any, model: str, pr
 
 
 def _run_face(result: Dict[str, Any], store_root: Path, media_path: Path, cv2: Any, model: str) -> Dict[str, Any]:
-    # An explicitly supplied face model remains supported for compatibility,
-    # but it is never interpreted as an identity model.
-    if model:
-        explicit = Path(model).expanduser()
-        if not explicit.is_file():
-            return _finish(result, "not_configured", f"Configured face model was not found: {explicit}")
-        return _run_yunet(result, media_path, cv2, explicit, {"key": "configured", "path": str(explicit), "actual_sha256": _sha256(explicit), "status": "available"})
+    explicit = model or os.environ.get("SENTINEL_FACE_MODEL", "")
+    if explicit:
+        # YuNet post-processing is architecture-specific. Require the pinned,
+        # hash-verified asset instead of accepting an arbitrary ONNX file that
+        # happens to load through FaceDetectorYN.
+        explicit_path, provenance = verify_model_file(FACE_MODEL, explicit)
+        result["model"] = explicit
+        result["findings"]["model_provenance"] = provenance
+        if explicit_path is None:
+            status = "unsupported" if provenance.get("status") == "invalid" else "not_configured"
+            return _finish(result, status, str(provenance.get("error", "Configured face model was not verified")))
+        return _run_yunet(result, media_path, cv2, explicit_path, provenance)
     yunet_path, provenance = resolve_model(FACE_MODEL, store_root)
     if yunet_path is not None:
         detected = _run_yunet(result, media_path, cv2, yunet_path, provenance)

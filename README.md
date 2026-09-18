@@ -134,6 +134,8 @@ python3 -m forensic_tool --data-dir data correlate CASE-XXXXXXXXXX
 python3 -m forensic_tool --data-dir data verify EVD-XXXXXXXXXXXX
 python3 -m forensic_tool --data-dir data export SEG-XXXXXXXXXXXX --format media
 python3 -m forensic_tool --data-dir data capabilities
+python3 -m forensic_tool --data-dir data models              # verify/provision NanoDet + YuNet
+python3 -m forensic_tool --data-dir data models --offline   # verify a pre-populated cache only
 python3 -m forensic_tool --data-dir data analytics SEG-XXXXXXXXXXXX --kind motion
 python3 -m forensic_tool --data-dir data report CASE-XXXXXXXXXX
 ```
@@ -146,8 +148,11 @@ volume for real examinations.
 
 The first object or face run downloads a fixed, hash-verified model into
 `data/models/` (or `SENTINEL_MODEL_DIR` when set). The result records the model
-name, source URL, expected and actual SHA-256, license, decoder, and derived
-artifact hash. This keeps model provenance separate from immutable evidence.
+name, source URL, expected and actual SHA-256, license, decoder, validation,
+NMS configuration, and derived artifact hash. This keeps model provenance
+separate from immutable evidence. Explicit model paths are accepted only when
+they match the same pinned detector asset; an arbitrary readable ONNX file is
+reported as invalid and cannot produce findings.
 
 - Object analytics use OpenCV Zoo NanoDet over the COCO classes by default.
 - Face indexing uses YuNet by default, then the OpenCV-bundled Haar cascade if
@@ -155,6 +160,10 @@ artifact hash. This keeps model provenance separate from immutable evidence.
 - Motion uses frame-difference regions and does not assert what caused a change.
 - A packaged FFmpeg fallback broadens decoding beyond OpenCV's native backend;
   system FFmpeg takes precedence when installed.
+- Run `python3 -m forensic_tool --data-dir data models` during connected-lab
+  preparation to verify/provision both pinned assets before an offline
+  examination. Use `models --offline` to verify a pre-populated cache without
+  network access.
 - Set `SENTINEL_AUTO_DOWNLOAD_MODELS=0` for an offline lab. The deterministic
   fallbacks remain available and the result says exactly which model was not
   used. Set `SENTINEL_MODEL_DIR` to a controlled, pre-approved model cache.

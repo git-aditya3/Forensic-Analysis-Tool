@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .analysis.engine import AnalysisEngine
+from .analysis.model_registry import provision_default_models
 from .exporter import ExportError, export_segment
 from .reporting import write_report
 from .server import serve
@@ -75,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     capabilities = commands.add_parser("capabilities", help="show optional decoder and model availability")
 
+    models = commands.add_parser("models", help="verify or provision the built-in analytics model cache")
+    models.add_argument("--offline", action="store_true", help="verify the cache only; do not download missing models")
+
     analytics = commands.add_parser("analytics", help="run optional post-acquisition media analytics")
     analytics.add_argument("segment_id")
     analytics.add_argument("--kind", choices=["motion", "object", "face"], required=True)
@@ -129,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(store.verify_evidence(args.evidence_id))
         elif args.command == "capabilities":
             _print(AnalysisEngine.capabilities())
+        elif args.command == "models":
+            _print(provision_default_models(args.data_dir, auto_download=not args.offline))
         elif args.command == "analytics":
             _print(AnalysisEngine(store).analytics(args.segment_id, args.kind, args.model))
         elif args.command == "export":
