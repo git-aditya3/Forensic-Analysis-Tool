@@ -178,7 +178,7 @@ def _pdf_from_lines(lines: Iterable[str]) -> bytes:
         commands = ["BT", "/F1 9 Tf", "48 750 Td", "12 TL"]
         for line in page:
             commands.append(f"({_pdf_escape(line[:180])}) Tj")
-            commands.append("0 -1.0 TD")
+            commands.append("0 -12 TD")
         commands.append("ET")
         stream = "\n".join(commands).encode("latin-1", errors="replace")
         objects.append(f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream")
