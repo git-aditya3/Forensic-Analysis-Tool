@@ -109,8 +109,12 @@ def _base_result(store: EvidenceStore, segment_id: str, kind: str, model: str) -
     evidence = store.get_evidence(segment["evidence_id"])
     if not evidence:
         raise KeyError(f"Unknown evidence: {segment['evidence_id']}")
-    if kind not in KINDS:
+    if not isinstance(kind, str) or kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(sorted(KINDS))}")
+    if model is None:
+        model = ""
+    if not isinstance(model, str):
+        raise ValueError("model must be a verified model path string or empty")
     started = utc_now()
     result = {
         "evidence_id": evidence["id"],

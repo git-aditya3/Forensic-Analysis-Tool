@@ -131,7 +131,7 @@ def export_segment(store: EvidenceStore, segment_id: str, output_format: str = "
     evidence = store.get_evidence(segment["evidence_id"])
     if not evidence:
         raise KeyError(f"Unknown evidence: {segment['evidence_id']}")
-    if output_format not in {"native", "media", "mp4"}:
+    if not isinstance(output_format, str) or output_format not in {"native", "media", "mp4"}:
         raise ValueError("output_format must be native, media, or mp4")
 
     native = _ensure_native(store, evidence, segment)

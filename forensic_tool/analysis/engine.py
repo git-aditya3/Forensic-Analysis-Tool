@@ -59,7 +59,7 @@ class AnalysisEngine:
         return sorted(kept, key=lambda item: item.start_offset)
 
     def recover(self, evidence_id: str, mode: str = "normal") -> Dict[str, Any]:
-        if mode not in {"normal", "deleted", "overwritten", "fragmented", "unallocated", "lost_corrupted"}:
+        if not isinstance(mode, str) or mode not in {"normal", "deleted", "overwritten", "fragmented", "unallocated", "lost_corrupted"}:
             raise ValueError("mode must be normal, deleted, overwritten, fragmented, unallocated, or lost_corrupted")
         evidence = self.store.get_evidence(evidence_id)
         if not evidence:
