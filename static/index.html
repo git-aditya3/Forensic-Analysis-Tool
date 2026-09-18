@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Sentinel DVR and NVR forensic examination workstation">
+  <title>Sentinel · Forensic Workbench</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><span></span><span></span><span></span></div>
+        <div><div class="brand-name">SENTINEL</div><div class="brand-sub">FORENSIC WORKBENCH</div></div>
+      </div>
+      <div class="case-rail">
+        <div class="eyebrow">ACTIVE EXAMINATION</div>
+        <div id="rail-case" class="rail-case">No case selected</div>
+        <div id="rail-status" class="rail-status"><i></i> Standby</div>
+      </div>
+      <nav class="nav" aria-label="Primary navigation">
+        <button class="nav-item active" data-view="overview"><span class="nav-icon">◈</span>Overview</button>
+        <button class="nav-item" data-view="acquisition"><span class="nav-icon">⇩</span>Acquire evidence</button>
+        <button class="nav-item" data-view="analysis"><span class="nav-icon">⌁</span>Analyze & recover</button>
+        <button class="nav-item" data-view="reports"><span class="nav-icon">▤</span>Reports</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="safe-note"><span class="lock">⌑</span><div><strong>READ-ONLY MODE</strong><br><small>Source bytes are never mounted or modified.</small></div></div>
+        <div class="version">SENTINEL <span id="version">v0.1.0</span></div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div class="breadcrumb"><span>EXAMINATIONS</span><b>/</b><strong id="crumb">Overview</strong></div>
+        <div class="top-actions"><div class="api-state"><i></i><span id="api-label">Local engine online</span></div><button id="refresh" class="icon-button" title="Refresh">↻</button></div>
+      </header>
+
+      <div id="toast" class="toast" role="status"></div>
+      <section id="view-overview" class="view active-view">
+        <div class="page-heading"><div><div class="kicker">CASE CONTROL</div><h1>Forensic overview</h1><p>Acquire a recorder image, preserve its fingerprints, then recover what ordinary operating systems cannot see.</p></div><button class="primary-button" id="new-case">＋ New examination</button></div>
+        <div class="metric-grid">
+          <div class="metric-card"><div class="metric-label">OPEN CASES</div><div class="metric-value" id="metric-cases">—</div><div class="metric-hint">in this workstation</div><div class="metric-glyph">⌂</div></div>
+          <div class="metric-card blue"><div class="metric-label">ACQUIRED SOURCES</div><div class="metric-value" id="metric-evidence">—</div><div class="metric-hint">hash-verified images</div><div class="metric-glyph">▣</div></div>
+          <div class="metric-card amber"><div class="metric-label">RECOVERED RANGES</div><div class="metric-value" id="metric-segments">—</div><div class="metric-hint">physical byte ranges</div><div class="metric-glyph">◒</div></div>
+          <div class="metric-card violet"><div class="metric-label">CUSTODY CHAINS</div><div class="metric-value" id="metric-chains">—</div><div class="metric-hint">integrity checked</div><div class="metric-glyph">⌁</div></div>
+        </div>
+        <div class="content-grid overview-grid">
+          <div class="panel cases-panel"><div class="panel-head"><div><h2>Examinations</h2><p>Choose a case to continue an evidence workflow.</p></div><span class="panel-count" id="case-count">0 CASES</span></div><div id="cases-list" class="cases-list"><div class="empty-state"><div class="empty-icon">◌</div><strong>No examinations yet</strong><span>Create a case to begin a preserved workflow.</span></div></div></div>
+          <div class="panel protocol-panel"><div class="panel-head"><div><h2>Examination protocol</h2><p>The core system follows a bounded, auditable path.</p></div></div><ol class="protocol"><li><span>01</span><div><strong>Acquire</strong><small>Copy source bytes and calculate MD5 / SHA-256.</small></div></li><li><span>02</span><div><strong>Identify</strong><small>Route by recorder signatures without mounting media.</small></div></li><li><span>03</span><div><strong>Recover</strong><small>Parse native blocks or carve surviving streams.</small></div></li><li><span>04</span><div><strong>Report</strong><small>Export ranges, hashes, audit trail, and findings.</small></div></li></ol><div class="protocol-foot"><i></i> Every action is appended to a hash-linked custody chain.</div></div>
+        </div>
+      </section>
+
+      <section id="view-acquisition" class="view">
+        <div class="page-heading"><div><div class="kicker">01 / PRESERVATION</div><h1>Acquire evidence</h1><p>Ingest a DVR/NVR disk image or raw storage copy. The original remains outside the case store and the acquired copy is write-protected.</p></div><div class="step-pill">STEP 01 <span>of 04</span></div></div>
+        <div id="acquisition-gate" class="notice warning"><span>!</span><div>Select or create a case before acquiring evidence.</div></div>
+        <div class="content-grid two-col"><div class="panel upload-panel"><div class="panel-head"><div><h2>Evidence source</h2><p>Raw image, E01, or recorder drive export</p></div><span class="read-badge">READ-ONLY</span></div><label id="drop-zone" class="drop-zone" for="file-input"><input id="file-input" type="file"><div class="upload-icon">⇧</div><strong>Drop an evidence image here</strong><span>or <u>browse from this workstation</u></span><small>Large files are streamed directly to the evidence store.</small></label><div id="upload-progress" class="upload-progress"><div class="progress-head"><span id="upload-name">Preparing source</span><b id="upload-percent">0%</b></div><div class="progress-track"><i id="upload-bar"></i></div></div></div><div class="panel intake-panel"><div class="panel-head"><div><h2>Acquisition guardrails</h2><p>Why this path is forensically safer</p></div></div><div class="guardrail"><span class="guard-icon">⊘</span><div><strong>No auto-mount</strong><small>The engine reads a regular acquired file; it never asks the OS to initialise or repair it.</small></div></div><div class="guardrail"><span class="guard-icon">#</span><div><strong>Dual fingerprints</strong><small>MD5 is retained for legacy workflows; SHA-256 is the primary integrity hash.</small></div></div><div class="guardrail"><span class="guard-icon">⌁</span><div><strong>Immutable trail</strong><small>Acquisition, identification, recovery, and reporting actions are chained in SQLite.</small></div></div></div></div>
+        <div class="panel evidence-panel"><div class="panel-head"><div><h2>Acquired sources</h2><p id="evidence-case-hint">Select a case to view its source inventory.</p></div></div><div id="evidence-list" class="evidence-list"><div class="empty-state compact"><span>No source selected.</span></div></div></div>
+      </section>
+
+      <section id="view-analysis" class="view">
+        <div class="page-heading"><div><div class="kicker">02–03 / INTERPRETATION</div><h1>Analyze & recover</h1><p>Identify a recorder family, choose a recovery posture, and preserve every result with its physical offset.</p></div><div class="step-pill">STEP 02 <span>of 04</span></div></div>
+        <div id="analysis-gate" class="notice warning"><span>!</span><div>Acquire an evidence source before analysis.</div></div>
+        <div class="analysis-layout"><div class="analysis-left"><div class="panel source-selector"><div class="panel-head"><div><h2>Evidence source</h2><p>Pick an acquired source to inspect.</p></div></div><div id="analysis-evidence-list" class="analysis-evidence-list"></div></div><div class="panel identify-panel"><div class="panel-head"><div><h2>Recorder identification</h2><p>Signature routing and filesystem clues</p></div><button class="secondary-button" id="identify-button">Run identification</button></div><div id="identity-result" class="identity-result"><div class="empty-state compact"><span>No identification run for this source.</span></div></div></div></div><div class="analysis-right"><div class="panel recovery-panel"><div class="panel-head"><div><h2>Recovery posture</h2><p>Choose how deeply to search the source</p></div><span class="engine-tag">ENGINE READY</span></div><div class="mode-options"><label class="mode-option selected"><input type="radio" name="mode" value="normal" checked><span class="mode-radio"></span><div><strong>Indexed / normal</strong><small>Parse recognised containers and recorder indexes.</small></div><em>FAST</em></label><label class="mode-option"><input type="radio" name="mode" value="deleted"><span class="mode-radio"></span><div><strong>Deleted candidates</strong><small>Scan raw and unallocated-looking regions for survivors.</small></div><em>DEEP</em></label><label class="mode-option"><input type="radio" name="mode" value="lost_corrupted"><span class="mode-radio"></span><div><strong>Lost / corrupted</strong><small>Bounded carving for fragmented or damaged streams.</small></div><em>MAX</em></label></div><button class="primary-button full" id="recover-button">Run recovery scan <span>→</span></button><div class="recovery-warning"><b>!</b> Carved footage may not retain timestamps. The result is a lead until corroborated by metadata.</div></div><div class="panel timeline-panel"><div class="panel-head"><div><h2>Recovered ranges</h2><p>Physical order with source-range hashes</p></div><span class="panel-count" id="segment-count">0 RANGES</span></div><div id="segments-list" class="segments-list"><div class="empty-state compact"><div class="empty-icon">⌁</div><span>Run recovery to populate the evidence timeline.</span></div></div></div></div></div>
+      </section>
+
+      <section id="view-reports" class="view">
+        <div class="page-heading"><div><div class="kicker">04 / DOCUMENTATION</div><h1>Reports & custody</h1><p>Generate a self-contained examination report with evidence fingerprints, recovered ranges, and the append-only audit chain.</p></div><div class="step-pill">STEP 04 <span>of 04</span></div></div>
+        <div id="report-gate" class="notice warning"><span>!</span><div>Select a case to generate its report.</div></div>
+        <div class="content-grid report-grid"><div class="panel report-preview"><div class="panel-head"><div><h2>Report package</h2><p id="report-case-label">No case selected</p></div><button class="primary-button" id="generate-report">Generate report</button></div><div class="report-hero"><div class="document-icon">▤</div><div><strong>Forensic examination report</strong><span>JSON · HTML · PDF</span></div><div class="report-chain" id="report-chain"><i></i> Awaiting case</div></div><div id="report-summary" class="report-summary"><div class="empty-state compact"><span>Generate a report after acquiring or analyzing evidence.</span></div></div><div id="report-links" class="report-links"></div></div><div class="panel custody-panel"><div class="panel-head"><div><h2>Chain of custody</h2><p>Cryptographically linked action history</p></div></div><div id="audit-list" class="audit-list"><div class="empty-state compact"><span>No case selected.</span></div></div></div></div>
+      </section>
+    </main>
+  </div>
+  <dialog id="case-dialog"><form method="dialog" id="case-form"><div class="dialog-head"><div><div class="kicker">NEW WORKFLOW</div><h2>Create examination</h2></div><button value="cancel" class="dialog-close">×</button></div><label>Case title<input id="case-title" required maxlength="240" placeholder="e.g. Station road incident · DVR 01"></label><label>Investigator<input id="case-investigator" maxlength="160" placeholder="Examiner name or badge number"></label><label>Notes <span class="optional">optional</span><textarea id="case-notes" maxlength="4000" placeholder="Seizure reference, device context, or scope…"></textarea></label><div class="dialog-actions"><button value="cancel" class="secondary-button">Cancel</button><button value="default" class="primary-button">Create case</button></div></form></dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+# Sentinel has no runtime dependencies. Python 3.10+ standard library is enough.
+# Optional: install ffmpeg separately for MP4 remuxing of native exports.
