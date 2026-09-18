@@ -133,13 +133,25 @@ class SentinelHandler(BaseHTTPRequestHandler):
                 raise ApiError("Case not found", 404)
             return self._send_json(self.app.store.case_bundle(parts[2]))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "evidence" and parts[3] == "timeline":
-            return self._send_json(self.app.engine.timeline(parts[2]))
+            query = urllib.parse.parse_qs(parsed.query)
+            tolerance = float(query.get("tolerance", ["2"])[0])
+            return self._send_json(self.app.engine.timeline(parts[2], tolerance))
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "cases" and parts[3] == "timeline":
+            query = urllib.parse.parse_qs(parsed.query)
+            tolerance = float(query.get("tolerance", ["2"])[0])
+            return self._send_json(self.app.engine.correlate_case(parts[2], tolerance))
+        if len(parts) == 4 and parts[:2] == ["api", "evidence"] and parts[3] == "integrity":
+            return self._send_json(self.app.store.verify_evidence(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "segments"] and parts[3] == "analytics":
+            return self._send_json({"segment_id": parts[2], "findings": self.app.store.list_analytics(parts[2])})
         if len(parts) == 3 and parts[:2] == ["api", "evidence"]:
             evidence = self.app.store.get_evidence(parts[2])
             if not evidence:
                 raise ApiError("Evidence not found", 404)
             evidence["identification"] = self.app.store.latest_identification(parts[2])
             evidence["segments"] = self.app.store.list_segments(parts[2])
+            for segment in evidence["segments"]:
+                segment["analytics"] = self.app.store.list_analytics(segment["id"])
             return self._send_json(evidence)
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].endswith((".html", ".pdf")):
             # Kept for compatibility with simple clients; the more specific
@@ -181,13 +193,32 @@ class SentinelHandler(BaseHTTPRequestHandler):
             if length > self.app.max_upload_bytes:
                 raise ApiError(f"Upload exceeds configured limit ({self.app.max_upload_bytes:,} bytes)", 413)
             name = self.headers.get("X-Filename", "evidence.img")
-            evidence = self.app.store.ingest_stream(case_id, _LimitedReader(self.rfile, length), name)
+            query = urllib.parse.parse_qs(parsed.query)
+            source_kind = query.get("source_kind", [self.headers.get("X-Source-Kind", "disk-image")])[0]
+            method = query.get("acquisition_method", [self.headers.get("X-Acquisition-Method", "streaming-bitstream-copy")])[0]
+            try:
+                sector_size = int(query.get("sector_size", [self.headers.get("X-Sector-Size", "512")])[0])
+            except ValueError as exc:
+                raise ApiError("sector_size must be an integer", 400) from exc
+            evidence = self.app.store.ingest_stream(
+                case_id,
+                _LimitedReader(self.rfile, length),
+                name,
+                source_kind=source_kind,
+                sector_size=sector_size,
+                acquisition_method=method,
+            )
             return self._send_json(evidence, 201)
         if len(parts) == 4 and parts[:2] == ["api", "evidence"] and parts[3] == "identify":
             return self._send_json(self.app.engine.identify(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "evidence"] and parts[3] == "recover":
             body = self._json_body()
             return self._send_json(self.app.engine.recover(parts[2], body.get("mode", "normal")))
+        if len(parts) == 4 and parts[:2] == ["api", "evidence"] and parts[3] == "verify":
+            return self._send_json(self.app.store.verify_evidence(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "segments"] and parts[3] == "analytics":
+            body = self._json_body()
+            return self._send_json(self.app.engine.analytics(parts[2], body.get("kind", "motion"), body.get("model", "")))
         if len(parts) == 4 and parts[:2] == ["api", "segments"] and parts[3] == "export":
             body = self._json_body()
             exported = export_segment(self.app.store, parts[2], body.get("format", "native"))

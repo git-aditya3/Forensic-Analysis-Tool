@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Optional
 
 from .hashing import hash_file, hash_stream
+from .imaging import AcquisitionPlan, open_source_read_only
 from .models import AuditEvent, Case, Evidence, Identification, Segment, VendorHit
 
 
@@ -44,7 +45,10 @@ CREATE TABLE IF NOT EXISTS evidence (
     sha256 TEXT NOT NULL,
     acquired_at TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'disk-image',
-    read_only INTEGER NOT NULL DEFAULT 1
+    read_only INTEGER NOT NULL DEFAULT 1,
+    source_kind TEXT NOT NULL DEFAULT 'disk-image',
+    acquisition_method TEXT NOT NULL DEFAULT 'streaming-bitstream-copy',
+    sector_size INTEGER NOT NULL DEFAULT 512
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_case ON evidence(case_id);
 CREATE TABLE IF NOT EXISTS identifications (
@@ -53,6 +57,7 @@ CREATE TABLE IF NOT EXISTS identifications (
     primary_vendor TEXT NOT NULL,
     confidence REAL NOT NULL,
     hits_json TEXT NOT NULL,
+    device_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_identifications_evidence ON identifications(evidence_id, created_at);
@@ -72,10 +77,26 @@ CREATE TABLE IF NOT EXISTS segments (
     end_time TEXT,
     source_sha256 TEXT,
     artifact_path TEXT,
+    payload_start_offset INTEGER,
+    payload_end_offset INTEGER,
     notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_segments_evidence ON segments(evidence_id, start_offset);
+CREATE TABLE IF NOT EXISTS analytics_findings (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_segment ON analytics_findings(segment_id, completed_at);
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -130,6 +151,31 @@ class EvidenceStore:
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            self._ensure_columns(
+                connection,
+                "evidence",
+                {
+                    "source_kind": "TEXT NOT NULL DEFAULT 'disk-image'",
+                    "acquisition_method": "TEXT NOT NULL DEFAULT 'streaming-bitstream-copy'",
+                    "sector_size": "INTEGER NOT NULL DEFAULT 512",
+                },
+            )
+            self._ensure_columns(connection, "identifications", {"device_json": "TEXT NOT NULL DEFAULT '{}'"})
+            self._ensure_columns(
+                connection,
+                "segments",
+                {
+                    "payload_start_offset": "INTEGER",
+                    "payload_end_offset": "INTEGER",
+                },
+            )
+
+    @staticmethod
+    def _ensure_columns(connection: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -198,13 +244,16 @@ class EvidenceStore:
         source_path: str | Path,
         original_name: Optional[str] = None,
         source: str = "disk-image",
+        source_kind: str = "disk-image",
+        sector_size: int = 512,
+        acquisition_method: str = "streaming-bitstream-copy",
     ) -> Dict[str, Any]:
         self.require_case(case_id)
+        plan = AcquisitionPlan(source_kind, sector_size, acquisition_method)
+        plan.validate()
         source_path = Path(source_path).expanduser().resolve()
-        if not source_path.is_file():
-            raise FileNotFoundError(f"Source file not found: {source_path}")
-        with source_path.open("rb") as stream:
-            return self._ingest_stream(case_id, stream, original_name or source_path.name, source)
+        with open_source_read_only(source_path) as stream:
+            return self._ingest_stream(case_id, stream, original_name or source_path.name, source, plan)
 
     def ingest_stream(
         self,
@@ -212,12 +261,17 @@ class EvidenceStore:
         stream: BinaryIO,
         original_name: str,
         source: str = "disk-image",
+        source_kind: str = "disk-image",
+        sector_size: int = 512,
+        acquisition_method: str = "streaming-bitstream-copy",
     ) -> Dict[str, Any]:
         self.require_case(case_id)
-        return self._ingest_stream(case_id, stream, original_name, source)
+        plan = AcquisitionPlan(source_kind, sector_size, acquisition_method)
+        plan.validate()
+        return self._ingest_stream(case_id, stream, original_name, source, plan)
 
     def _ingest_stream(
-        self, case_id: str, stream: BinaryIO, original_name: str, source: str
+        self, case_id: str, stream: BinaryIO, original_name: str, source: str, plan: AcquisitionPlan
     ) -> Dict[str, Any]:
         evidence_id = f"EVD-{uuid.uuid4().hex[:12].upper()}"
         safe_name = _safe_name(original_name)
@@ -227,6 +281,8 @@ class EvidenceStore:
         try:
             with destination.open("wb") as output:
                 digest = hash_stream(_TeeReader(stream, output))
+                output.flush()
+                os.fsync(output.fileno())
             # HTTP uploads are wrapped in a length-limited reader.  Refuse a
             # truncated body before creating the metadata row; otherwise a
             # network interruption could be mistaken for a complete image.
@@ -243,8 +299,8 @@ class EvidenceStore:
             relative_path = str(destination.relative_to(self.root))
             with self._transaction() as connection:
                 connection.execute(
-                    """INSERT INTO evidence(id,case_id,original_name,storage_path,size,md5,sha256,acquired_at,source,read_only)
-                       VALUES(?,?,?,?,?,?,?,?,?,1)""",
+                    """INSERT INTO evidence(id,case_id,original_name,storage_path,size,md5,sha256,acquired_at,source,read_only,source_kind,acquisition_method,sector_size)
+                       VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?)""",
                     (
                         evidence_id,
                         case_id,
@@ -255,6 +311,9 @@ class EvidenceStore:
                         str(digest["sha256"]),
                         acquired_at,
                         source,
+                        plan.source_kind,
+                        plan.method,
+                        plan.sector_size,
                     ),
                 )
                 self._audit_in_transaction(
@@ -268,6 +327,9 @@ class EvidenceStore:
                         "md5": digest["md5"],
                         "sha256": digest["sha256"],
                         "source": source,
+                        "source_kind": plan.source_kind,
+                        "acquisition_method": plan.method,
+                        "sector_size": plan.sector_size,
                     },
                 )
         except Exception:
@@ -302,18 +364,54 @@ class EvidenceStore:
             raise KeyError(f"Unknown evidence: {evidence_id}")
         return EvidenceReader(evidence["absolute_path"])
 
+    def verify_evidence(self, evidence_id: str, record: bool = True) -> Dict[str, Any]:
+        evidence = self.get_evidence(evidence_id)
+        if not evidence:
+            raise KeyError(f"Unknown evidence: {evidence_id}")
+        try:
+            actual = hash_file(Path(evidence["absolute_path"]))
+            hash_error = None
+        except OSError as error:
+            actual = {"size": None, "md5": None, "sha256": None}
+            hash_error = str(error)
+        result = {
+            "evidence_id": evidence_id,
+            "expected": {"size": evidence["size"], "md5": evidence["md5"], "sha256": evidence["sha256"]},
+            "actual": actual,
+            "valid": (
+                actual["size"] is not None
+                and int(actual["size"]) == int(evidence["size"])
+                and str(actual["md5"]) == str(evidence["md5"])
+                and str(actual["sha256"]) == str(evidence["sha256"])
+            ),
+            "read_only": bool(evidence["read_only"]),
+            "verified_at": utc_now(),
+            "error": hash_error,
+        }
+        if record:
+            self.record_audit(evidence["case_id"], "evidence_integrity_verified", result)
+        return result
+
     # ---- analysis result persistence ----------------------------------
-    def save_identification(self, evidence_id: str, primary_vendor: str, confidence: float, hits: List[VendorHit]) -> Dict[str, Any]:
+    def save_identification(
+        self,
+        evidence_id: str,
+        primary_vendor: str,
+        confidence: float,
+        hits: List[VendorHit],
+        device_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         evidence = self.get_evidence(evidence_id)
         if not evidence:
             raise KeyError(f"Unknown evidence: {evidence_id}")
         identification_id = f"ID-{uuid.uuid4().hex[:12].upper()}"
         created_at = utc_now()
         hit_values = [hit.to_dict() for hit in hits]
+        device_info = device_info or {}
         with self._transaction() as connection:
             connection.execute(
-                "INSERT INTO identifications(id,evidence_id,primary_vendor,confidence,hits_json,created_at) VALUES(?,?,?,?,?,?)",
-                (identification_id, evidence_id, primary_vendor, confidence, json.dumps(hit_values, sort_keys=True), created_at),
+                "INSERT INTO identifications(id,evidence_id,primary_vendor,confidence,hits_json,device_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (identification_id, evidence_id, primary_vendor, confidence, json.dumps(hit_values, sort_keys=True), json.dumps(device_info, sort_keys=True), created_at),
             )
             self._audit_in_transaction(
                 connection,
@@ -325,6 +423,8 @@ class EvidenceStore:
                     "primary_vendor": primary_vendor,
                     "confidence": confidence,
                     "hit_count": len(hit_values),
+                    "device_models": device_info.get("models", []),
+                    "firmware_candidates": device_info.get("firmware", []),
                 },
             )
         return {
@@ -333,6 +433,7 @@ class EvidenceStore:
             "primary_vendor": primary_vendor,
             "confidence": confidence,
             "hits": hit_values,
+            "device": device_info,
             "created_at": created_at,
         }
 
@@ -346,6 +447,7 @@ class EvidenceStore:
             return None
         value = dict(row)
         value["hits"] = json.loads(value.pop("hits_json"))
+        value["device"] = json.loads(value.pop("device_json", "{}") or "{}")
         return value
 
     def save_segments(self, evidence_id: str, segments: Iterable[Segment], mode: str) -> List[Dict[str, Any]]:
@@ -375,8 +477,8 @@ class EvidenceStore:
                     continue
                 created_at = segment.created_at or utc_now()
                 connection.execute(
-                    """INSERT INTO segments(id,evidence_id,vendor,source,recovery_mode,state,channel,start_offset,end_offset,codec,confidence,start_time,end_time,source_sha256,artifact_path,notes,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO segments(id,evidence_id,vendor,source,recovery_mode,state,channel,start_offset,end_offset,codec,confidence,start_time,end_time,source_sha256,artifact_path,payload_start_offset,payload_end_offset,notes,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         segment.id,
                         evidence_id,
@@ -393,6 +495,8 @@ class EvidenceStore:
                         segment.end_time,
                         segment.source_sha256,
                         segment.artifact_path,
+                        segment.payload_start_offset,
+                        segment.payload_end_offset,
                         segment.notes,
                         created_at,
                     ),
@@ -415,6 +519,71 @@ class EvidenceStore:
                 },
             )
         return persisted
+
+    def save_analytics(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist an analytics run and append it to the custody chain."""
+        evidence = self.get_evidence(result["evidence_id"])
+        if not evidence:
+            raise KeyError(f"Unknown evidence: {result['evidence_id']}")
+        finding_id = result.get("id") or f"AN-{uuid.uuid4().hex[:12].upper()}"
+        result = dict(result, id=finding_id, case_id=evidence["case_id"])
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO analytics_findings(id,case_id,evidence_id,segment_id,kind,status,model,started_at,completed_at,findings_json,notes)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    finding_id,
+                    evidence["case_id"],
+                    result["evidence_id"],
+                    result["segment_id"],
+                    result["kind"],
+                    result["status"],
+                    result.get("model", ""),
+                    result["started_at"],
+                    result["completed_at"],
+                    json.dumps(result.get("findings", {}), sort_keys=True),
+                    result.get("notes", ""),
+                ),
+            )
+            self._audit_in_transaction(
+                connection,
+                evidence["case_id"],
+                "analytics_completed",
+                {
+                    "finding_id": finding_id,
+                    "evidence_id": result["evidence_id"],
+                    "segment_id": result["segment_id"],
+                    "kind": result["kind"],
+                    "status": result["status"],
+                },
+            )
+        return result
+
+    def list_analytics(self, segment_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM analytics_findings WHERE segment_id=? ORDER BY completed_at DESC",
+                (segment_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            value["findings"] = json.loads(value.pop("findings_json"))
+            values.append(value)
+        return values
+
+    def list_case_analytics(self, case_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM analytics_findings WHERE case_id=? ORDER BY completed_at DESC",
+                (case_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            value["findings"] = json.loads(value.pop("findings_json"))
+            values.append(value)
+        return values
 
     def list_segments(self, evidence_id: str) -> List[Dict[str, Any]]:
         with self._connect() as connection:
@@ -499,9 +668,13 @@ class EvidenceStore:
     def case_bundle(self, case_id: str) -> Dict[str, Any]:
         case = self.require_case(case_id)
         evidence = self.list_evidence(case_id)
+        analytics = self.list_case_analytics(case_id)
         for item in evidence:
             item["identification"] = self.latest_identification(item["id"])
             item["segments"] = self.list_segments(item["id"])
+            for segment in item["segments"]:
+                segment["analytics"] = self.list_analytics(segment["id"])
+            item["analytics"] = [finding for finding in analytics if finding["evidence_id"] == item["id"]]
         return {"case": case, "evidence": evidence, "audit": self.audit_events(case_id), "chain": self.verify_chain(case_id)}
 
     def export_path(self, case_id: str, segment_id: str, suffix: str) -> Path:

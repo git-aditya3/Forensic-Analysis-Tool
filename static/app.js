@@ -159,7 +159,7 @@ function renderAcquisition() {
     return;
   }
 
-  list.innerHTML = evidence.map((item) => `<div class="evidence-row ${state.currentEvidence?.id === item.id ? 'selected' : ''}" data-evidence="${esc(item.id)}"><div class="evidence-file-icon">▣</div><div class="evidence-main"><div class="evidence-name">${esc(item.original_name)}</div><div class="evidence-meta">${esc(item.id)} · ${bytes(item.size)} · acquired ${date(item.acquired_at)}</div></div><div class="evidence-hash">${esc(item.sha256)}</div><div class="hash-ok">✓ HASHED</div></div>`).join('');
+  list.innerHTML = evidence.map((item) => `<div class="evidence-row ${state.currentEvidence?.id === item.id ? 'selected' : ''}" data-evidence="${esc(item.id)}"><div class="evidence-file-icon">▣</div><div class="evidence-main"><div class="evidence-name">${esc(item.original_name)}</div><div class="evidence-meta">${esc(item.id)} · ${bytes(item.size)} · ${esc(item.source_kind || item.source || 'source')} · ${item.sector_size || 512} B sectors · acquired ${date(item.acquired_at)}</div></div><div class="evidence-hash">${esc(item.sha256)}</div><div class="hash-ok">✓ HASHED</div></div>`).join('');
   $$('.evidence-row').forEach((row) => row.addEventListener('click', () => {
     state.currentEvidence = evidence.find((item) => item.id === row.dataset.evidence) || null;
     renderAll();
@@ -173,6 +173,7 @@ function renderAnalysis() {
   $('#identify-button').disabled = !active;
   $('#recover-button').disabled = !active;
   $('#segment-count').textContent = '0 RANGES';
+  if ($('#timeline-summary')) $('#timeline-summary').innerHTML = '<div class="empty-state compact"><span>Synchronize after recovering segments.</span></div>';
   const list = $('#analysis-evidence-list');
 
   if (!evidence.length) {
@@ -198,7 +199,10 @@ function renderAnalysis() {
     const primary = identity.hits?.find((hit) => hit.vendor === identity.primary_vendor) || identity.hits?.[0] || {};
     const chips = (identity.hits || []).map((hit) => `<span class="hit-chip">${esc(hit.display_name)} <em>${Math.round((hit.confidence || 0) * 100)}%</em></span>`).join('');
     const limitation = (primary.limitations || [])[0] || 'Interpretation remains bounded to the observed signatures.';
-    $('#identity-result').innerHTML = `<div class="identity-main"><div class="vendor-logo">⌁</div><div><strong>${esc(primary.display_name || identity.primary_vendor)}</strong><small>${esc(primary.filesystem || 'unidentified')} · route ${esc(primary.route || 'generic')}</small></div><div class="confidence"><b>${Math.round((identity.confidence || 0) * 100)}%</b><small>CONFIDENCE</small></div></div><div class="hit-list">${chips || '<span class="hit-chip">No specific signature</span>'}</div><div class="limitation">${esc(limitation)}</div>`;
+    const device = identity.device || {};
+    const modelText = (device.models || []).slice(0, 4).join(', ') || 'No model candidate';
+    const firmwareText = (device.firmware || []).slice(0, 4).join(', ') || 'No firmware candidate';
+    $('#identity-result').innerHTML = `<div class="identity-main"><div class="vendor-logo">⌁</div><div><strong>${esc(primary.display_name || identity.primary_vendor)}</strong><small>${esc(primary.filesystem || 'unidentified')} · route ${esc(primary.route || 'generic')}</small></div><div class="confidence"><b>${Math.round((identity.confidence || 0) * 100)}%</b><small>CONFIDENCE</small></div></div><div class="hit-list">${chips || '<span class="hit-chip">No specific signature</span>'}</div><div class="device-summary"><strong>Model candidate:</strong> ${esc(modelText)}<br><strong>Firmware candidate:</strong> ${esc(firmwareText)}<br><small>Metadata candidates are not hardware attestation.</small></div><div class="limitation">${esc(limitation)}</div>`;
   }
 
   const segments = state.currentEvidence?.segments || [];
@@ -208,7 +212,8 @@ function renderAnalysis() {
     segList.innerHTML = '<div class="empty-state compact"><div class="empty-icon">⌁</div><span>Run recovery to populate the evidence timeline.</span></div>';
     return;
   }
-  segList.innerHTML = segments.map((seg, index) => `<div class="segment-row"><div class="segment-index">RANGE ${String(index + 1).padStart(2, '0')}</div><div class="segment-title">${esc(seg.codec)} · ${esc(seg.state)}<small>${esc(seg.source)} · ${bytes(seg.size)} · offset 0x${Number(seg.start_offset).toString(16).toUpperCase()}</small></div><div class="segment-facts"><strong>${Math.round((seg.confidence || 0) * 100)}%</strong><small>${esc(seg.recovery_mode)}</small></div><div class="segment-actions"><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=native">↓ Native bytes</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=mp4">▶ MP4 if ffmpeg</a></div></div>`).join('');
+  segList.innerHTML = segments.map((seg, index) => { const latest = (seg.analytics || [])[0]; return `<div class="segment-row"><div class="segment-index">RANGE ${String(index + 1).padStart(2, '0')}</div><div class="segment-title">${esc(seg.codec)} · ${esc(seg.state)}<small>${esc(seg.source)} · ${bytes(seg.size)} · offset 0x${Number(seg.start_offset).toString(16).toUpperCase()}${seg.payload_start_offset != null ? ` · payload 0x${Number(seg.payload_start_offset).toString(16).toUpperCase()}–0x${Number(seg.payload_end_offset).toString(16).toUpperCase()}` : ''}</small></div><div class="segment-facts"><strong>${Math.round((seg.confidence || 0) * 100)}%</strong><small>${esc(seg.recovery_mode)}</small></div><div class="segment-actions"><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=native">↓ Native</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=media">◈ Media payload</a><a class="tiny-link" href="/api/segments/${encodeURIComponent(seg.id)}/export?format=mp4">▶ MP4</a><select class="analytics-kind" data-segment="${esc(seg.id)}"><option value="motion">Motion</option><option value="object">Objects</option><option value="face">Faces</option></select><button class="tiny-link run-analytics" data-segment="${esc(seg.id)}">Run</button>${latest ? `<span class="status-pill ${esc(latest.status)}">${esc(latest.kind)}: ${esc(latest.status)}</span>` : ''}</div></div>`; }).join('');
+  $$('.run-analytics').forEach((button) => button.addEventListener('click', () => runAnalytics(button.dataset.segment, button.parentElement.querySelector('.analytics-kind')?.value || 'motion', button)));
 }
 
 function renderReports() {
@@ -313,7 +318,12 @@ async function upload(file) {
   $('#upload-percent').textContent = 'Uploading…';
   $('#upload-bar').style.width = '8%';
   try {
-    const item = await api(`/api/cases/${encodeURIComponent(currentCaseId())}/evidence`, {
+    const query = new URLSearchParams({
+      source_kind: $('#source-kind')?.value || 'disk-image',
+      sector_size: $('#sector-size')?.value || '512',
+      acquisition_method: $('#acquisition-method')?.value || 'streaming-bitstream-copy',
+    });
+    const item = await api(`/api/cases/${encodeURIComponent(currentCaseId())}/evidence?${query.toString()}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': file.name },
       body: file,
@@ -365,12 +375,66 @@ async function recover() {
     });
     await refreshSelectedCase(evidenceId);
     showView('analysis');
+    await loadTimeline();
     toast(`Recovery complete · ${result.segment_count} range${result.segment_count === 1 ? '' : 's'}`);
   } catch (error) {
     toast(error.message, true);
   } finally {
     button.innerHTML = 'Run recovery scan <span>→</span>';
     button.disabled = false;
+  }
+}
+
+async function runAnalytics(segmentId, kind, button) {
+  if (!segmentId) return;
+  button.disabled = true;
+  button.textContent = '…';
+  try {
+    const result = await api(`/api/segments/${encodeURIComponent(segmentId)}/analytics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind }),
+    });
+    await refreshSelectedCase(state.currentEvidence?.id);
+    toast(`${kind} analytics: ${result.status}`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Run';
+  }
+}
+
+async function verifySelected() {
+  if (!state.currentEvidence) return;
+  const button = $('#verify-evidence');
+  button.disabled = true;
+  try {
+    const result = await api(`/api/evidence/${encodeURIComponent(state.currentEvidence.id)}/verify`, { method: 'POST' });
+    toast(result.valid ? 'Evidence hashes verified' : 'Integrity mismatch detected', !result.valid);
+    await refreshSelectedCase(state.currentEvidence.id);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadTimeline() {
+  if (!currentCaseId()) return;
+  const node = $('#timeline-summary');
+  const tolerance = Number($('#timeline-tolerance')?.value || 2);
+  node.innerHTML = '<div class="identity-empty">Normalizing timestamps…</div>';
+  try {
+    const result = await api(`/api/cases/${encodeURIComponent(currentCaseId())}/timeline?tolerance=${encodeURIComponent(tolerance)}`);
+    const correlations = result.correlations || [];
+    const events = result.events || [];
+    const stats = `<div class="timeline-stat"><span>${events.length} events</span><span>${correlations.length} cross-camera correlations</span><span>${tolerance}s tolerance</span></div>`;
+    const rows = events.slice(0, 80).map((event) => `<div class="timeline-event"><div><strong>${esc(event.event_id)} · ch ${event.channel ?? '—'}</strong><small>${esc(event.start?.utc || 'No timestamp')} · ${esc(event.state || 'unknown')} · offset 0x${Number(event.physical_range.start_offset).toString(16).toUpperCase()}</small></div><span class="corr">${esc(event.correlation_id || 'untimed')}</span></div>`).join('');
+    const note = correlations.length ? `<div class="device-summary"><strong>Correlated windows:</strong> ${correlations.map((item) => `${esc(item.correlation_id)} (${esc(item.channels.join(', '))})`).join(' · ')}</div>` : '';
+    node.innerHTML = stats + (rows || '<div class="identity-empty">No recovered events yet.</div>') + note;
+  } catch (error) {
+    node.innerHTML = `<div class="identity-empty">${esc(error.message)}</div>`;
   }
 }
 
@@ -409,6 +473,8 @@ function wire() {
     }
   });
 
+  $('#verify-evidence').addEventListener('click', verifySelected);
+  $('#load-timeline').addEventListener('click', loadTimeline);
   $('#file-input').addEventListener('change', (event) => {
     const file = event.target.files[0];
     if (file) upload(file);

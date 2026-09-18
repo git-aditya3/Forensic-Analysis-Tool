@@ -11,23 +11,77 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from . import __version__
+from .analysis.timeline import build_timeline
 from .storage import EvidenceStore, utc_now
 
 
 def build_report(store: EvidenceStore, case_id: str) -> Dict[str, Any]:
     bundle = store.case_bundle(case_id)
+    all_segments = [segment for item in bundle["evidence"] for segment in item.get("segments", [])]
+    timeline = build_timeline(all_segments)
+    acquisition = [
+        {
+            "evidence_id": item["id"],
+            "original_name": item["original_name"],
+            "size": item["size"],
+            "source_kind": item.get("source_kind", item.get("source", "unknown")),
+            "acquisition_method": item.get("acquisition_method", "unknown"),
+            "sector_size": item.get("sector_size"),
+            "read_only": bool(item.get("read_only")),
+            "md5": item["md5"],
+            "sha256": item["sha256"],
+            "acquired_at": item["acquired_at"],
+        }
+        for item in bundle["evidence"]
+    ]
+    artifact_inventory = []
+    for event in bundle["audit"]:
+        if event.get("action") != "segment_exported":
+            continue
+        details = event.get("payload", {}).get("details", {})
+        output_format = details.get("format")
+        classification = {
+            "native": "exact_native_source_range",
+            "media": "demuxed_or_bounded_payload",
+            "mp4": "derived_container_remux",
+        }.get(output_format, "derived_artifact")
+        artifact_inventory.append({"classification": classification, **details})
+    codec_review = []
+    for segment in all_segments:
+        codec = segment.get("codec", "unknown")
+        codec_review.append({
+            "segment_id": segment["id"],
+            "codec": codec,
+            "status": "native_preserved" if codec in {"H.264", "H.265", "MPEG-PS", "DHAV", "DHAV-audio"} else "unsupported_or_unclassified",
+            "note": "Native bytes remain available even when no decoder or remux route is configured.",
+        })
+    checklist = [
+        {"item": "Confirm seizure/search authority and examination scope", "status": "review_required"},
+        {"item": "Record source device, write-blocker, operator, and transfer details", "status": "review_required"},
+        {"item": "Independently verify MD5 and SHA-256 against the acquisition record", "status": "review_required"},
+        {"item": "Confirm jurisdiction-specific handling of native, demuxed, and derived artifacts", "status": "review_required"},
+        {"item": "Have an appropriately qualified reviewer assess clock assumptions, decoder limitations, and model outputs", "status": "review_required"},
+        {"item": "Legal admissibility determination", "status": "not_determined_by_tool"},
+    ]
     return {
         "report_type": "DVR/NVR forensic examination report",
         "generated_at": utc_now(),
         "tool": {"name": "Sentinel Forensic Analysis Tool", "version": __version__},
         "case": bundle["case"],
+        "acquisition_inventory": acquisition,
         "evidence": bundle["evidence"],
+        "artifact_inventory": artifact_inventory,
+        "codec_review": codec_review,
+        "timeline": timeline,
+        "analytics": bundle["analytics"] if "analytics" in bundle else [finding for item in bundle["evidence"] for finding in item.get("analytics", [])],
         "chain_of_custody": bundle["chain"],
         "audit_log": bundle["audit"],
+        "admissibility_review_checklist": checklist,
         "interpretation": [
-            "This report records observations and physical byte ranges produced by the open-source examination engine.",
-            "Vendor signatures and carved media are investigative findings; they are not, by themselves, proof of recorder identity, deletion, authorship, or event time.",
-            "The original acquired bytes remain unchanged. Native exports are exact source ranges; any optional remux is separately identified.",
+            "This report records observations, hashes, and physical byte ranges produced by the open-source examination engine.",
+            "Vendor/model/firmware values are evidence-derived candidates, not hardware attestation. Vendor signatures and carved media are investigative findings; they are not, by themselves, proof of recorder identity, deletion, authorship, or event time.",
+            "The original acquired bytes remain unchanged. Native exports are exact source ranges; demuxed payloads and optional remuxes are separately identified derived artifacts.",
+            "Motion, object, and facial analytics are reported only when a compatible decoder/model is available; not_configured and unsupported statuses are preserved rather than replaced with fabricated findings.",
         ],
     }
 
@@ -78,13 +132,17 @@ def render_html(report: Dict[str, Any]) -> str:
         vendor = identity.get("primary_vendor", "not run")
         confidence = identity.get("confidence")
         label = f"{vendor} ({confidence:.0%})" if isinstance(confidence, (int, float)) else vendor
+        device = identity.get("device") or {}
+        candidates = "; ".join((device.get("models") or [])[:2]) or "no model candidate"
+        firmware = ", ".join((device.get("firmware") or [])[:2]) or "no firmware candidate"
+        label_html = f"{html.escape(label)}<br><small>model: {html.escape(candidates)}<br>firmware: {html.escape(firmware)}</small>"
         rows.append(
             "<tr>"
             f"<td>{html.escape(item['id'])}</td>"
             f"<td>{html.escape(item['original_name'])}</td>"
             f"<td>{item['size']:,}</td>"
             f"<td><code>{html.escape(item['sha256'])}</code></td>"
-            f"<td>{html.escape(label)}</td>"
+            f"<td>{label_html}</td>"
             f"<td>{len(item.get('segments', []))}</td>"
             "</tr>"
         )
@@ -97,6 +155,28 @@ def render_html(report: Dict[str, Any]) -> str:
             f"<td><code>{html.escape(event['event_hash'])}</code></td></tr>"
         )
     interpretations = "".join(f"<li>{html.escape(line)}</li>" for line in report["interpretation"])
+    acquisition_rows = "".join(
+        f"<tr><td>{html.escape(item['evidence_id'])}</td><td>{html.escape(str(item['source_kind']))}</td><td>{html.escape(str(item['acquisition_method']))}</td><td>{item.get('sector_size') or '—'}</td><td>{'YES' if item.get('read_only') else 'NO'}</td><td><code>{html.escape(item['md5'])}</code></td></tr>"
+        for item in report.get("acquisition_inventory", [])
+    )
+    checklist_rows = "".join(
+        f"<tr><td>{html.escape(item['item'])}</td><td>{html.escape(item['status'])}</td></tr>"
+        for item in report.get("admissibility_review_checklist", [])
+    )
+    analytics_rows = "".join(
+        f"<tr><td>{html.escape(item.get('segment_id', ''))}</td><td>{html.escape(item.get('kind', ''))}</td><td>{html.escape(item.get('status', ''))}</td><td>{html.escape(item.get('notes', ''))}</td></tr>"
+        for item in report.get("analytics", [])
+    )
+    artifact_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('segment_id', '')))}</td><td>{html.escape(str(item.get('format', '')))}</td><td>{html.escape(str(item.get('classification', '')))}</td><td><code>{html.escape(str(item.get('sha256', '')))}</code></td></tr>"
+        for item in report.get("artifact_inventory", [])
+    )
+    codec_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('segment_id', '')))}</td><td>{html.escape(str(item.get('codec', '')))}</td><td>{html.escape(str(item.get('status', '')))}</td></tr>"
+        for item in report.get("codec_review", [])
+    )
+    correlations = report.get("timeline", {}).get("correlations", [])
+    correlation_text = ", ".join(f"{item['correlation_id']}: channels {', '.join(str(channel) for channel in item['channels'])}" for item in correlations) or "No cross-camera correlations met the configured timestamp tolerance."
     chain = report["chain_of_custody"]
     chain_label = "VALID" if chain.get("valid") else "BROKEN"
     return f"""<!doctype html>
@@ -110,6 +190,12 @@ Investigator: {html.escape(case.get('investigator') or 'Not specified')} · Gene
 Chain of custody: <span class="badge">{chain_label}</span> ({chain.get('event_count', 0)} events)</div>
 <h2>Scope and interpretation</h2><ul>{interpretations}</ul>
 <h2>Evidence inventory</h2><table><thead><tr><th>ID</th><th>Acquired name</th><th>Bytes</th><th>SHA-256</th><th>Identification</th><th>Segments</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No evidence acquired.</td></tr>'}</tbody></table>
+<h2>Acquisition and integrity</h2><table><thead><tr><th>Evidence</th><th>Source kind</th><th>Method</th><th>Sector bytes</th><th>Read-only</th><th>MD5</th></tr></thead><tbody>{acquisition_rows or '<tr><td colspan="6">No acquisition records.</td></tr>'}</tbody></table>
+<h2>Artifact classification</h2><table><thead><tr><th>Segment</th><th>Format</th><th>Classification</th><th>SHA-256</th></tr></thead><tbody>{artifact_rows or '<tr><td colspan="4">No derived exports recorded.</td></tr>'}</tbody></table>
+<h2>Codec handling</h2><table><thead><tr><th>Segment</th><th>Codec hint</th><th>Status</th></tr></thead><tbody>{codec_rows or '<tr><td colspan="3">No recovered ranges.</td></tr>'}</tbody></table>
+<h2>Timeline and correlation</h2><p>{html.escape(correlation_text)}</p><p class="meta">{html.escape(' '.join(report.get('timeline', {}).get('limitations', [])))}</p>
+<h2>Analytics status</h2><table><thead><tr><th>Segment</th><th>Kind</th><th>Status</th><th>Notes</th></tr></thead><tbody>{analytics_rows or '<tr><td colspan="4">No analytics runs.</td></tr>'}</tbody></table>
+<h2>Admissibility review checklist</h2><table><thead><tr><th>Review item</th><th>Status</th></tr></thead><tbody>{checklist_rows}</tbody></table>
 <h2>Audit chain</h2><table><thead><tr><th>#</th><th>UTC</th><th>Action</th><th>Event hash</th></tr></thead><tbody>{''.join(audit_rows) or '<tr><td colspan="4">No events.</td></tr>'}</tbody></table>
 <footer>Sentinel {html.escape(report['tool']['version'])}. This technical report is a record of tool observations and does not make a legal admissibility determination.</footer>
 </body></html>"""
@@ -131,16 +217,32 @@ def render_pdf(report: Dict[str, Any]) -> bytes:
     ]
     for item in report["evidence"]:
         identity = item.get("identification") or {}
+        device = identity.get("device") or {}
         lines.extend(
             [
                 f"{item['id']}  {item['original_name']}  {item['size']} bytes",
                 f"MD5    {item['md5']}",
                 f"SHA256 {item['sha256']}",
                 f"Vendor {identity.get('primary_vendor', 'not run')}  segments={len(item.get('segments', []))}",
+                f"Model candidates: {', '.join(device.get('models', [])) or 'none'}",
+                f"Firmware candidates: {', '.join(device.get('firmware', [])) or 'none'}",
                 "",
             ]
         )
-    lines.extend(["INTERPRETATION", *report["interpretation"], "", "This report records tool observations; it is not a legal opinion."])
+    lines.extend(["ACQUISITION / INTEGRITY"])
+    for item in report.get("acquisition_inventory", []):
+        lines.extend([f"{item['evidence_id']} source={item['source_kind']} method={item['acquisition_method']} read_only={item['read_only']}", f"MD5 {item['md5']}", f"SHA256 {item['sha256']}"])
+    correlation_lines = [f"{item['correlation_id']} channels={item['channels']} {item['start']} to {item['end']}" for item in report.get("timeline", {}).get("correlations", [])] or ["None"]
+    lines.extend(["", "ARTIFACT CLASSIFICATION"])
+    for item in report.get("artifact_inventory", []):
+        lines.append(f"{item.get('segment_id')} {item.get('format')} {item.get('classification')} sha256={item.get('sha256')}")
+    lines.extend(["", "CODEC HANDLING"])
+    for item in report.get("codec_review", []):
+        lines.append(f"{item.get('segment_id')} codec={item.get('codec')} status={item.get('status')}")
+    lines.extend(["", "TIMELINE CORRELATIONS", *correlation_lines, "", "ANALYTICS"])
+    for item in report.get("analytics", []):
+        lines.append(f"{item.get('segment_id')} {item.get('kind')} status={item.get('status')}")
+    lines.extend(["", "ADMISSIBILITY REVIEW CHECKLIST", *[f"[{item['status']}] {item['item']}" for item in report.get("admissibility_review_checklist", [])], "", "INTERPRETATION", *report["interpretation"], "", "This report records tool observations; it is not a legal opinion."])
     return _pdf_from_lines(lines)
 
 

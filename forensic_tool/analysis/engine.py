@@ -8,7 +8,10 @@ from typing import Any, Dict, Iterable, List, Optional
 from ..models import Segment
 from ..storage import EvidenceStore, utc_now
 from .detector import DetectionResult, detect
+from .analytics import run_analytics
+from .device import identify_device
 from .parsers import Candidate, parser_for
+from .timeline import build_timeline
 
 
 class AnalysisEngine:
@@ -18,11 +21,13 @@ class AnalysisEngine:
     def identify(self, evidence_id: str) -> Dict[str, Any]:
         reader = self.store.evidence_reader(evidence_id)
         result = detect(reader)
+        device_info = identify_device(reader)
         saved = self.store.save_identification(
             evidence_id,
             result.primary.vendor,
             result.primary.confidence,
             result.hits,
+            device_info=device_info,
         )
         saved["primary"] = result.primary.to_dict()
         return saved
@@ -54,8 +59,8 @@ class AnalysisEngine:
         return sorted(kept, key=lambda item: item.start_offset)
 
     def recover(self, evidence_id: str, mode: str = "normal") -> Dict[str, Any]:
-        if mode not in {"normal", "deleted", "lost_corrupted"}:
-            raise ValueError("mode must be normal, deleted, or lost_corrupted")
+        if mode not in {"normal", "deleted", "overwritten", "fragmented", "unallocated", "lost_corrupted"}:
+            raise ValueError("mode must be normal, deleted, overwritten, fragmented, unallocated, or lost_corrupted")
         evidence = self.store.get_evidence(evidence_id)
         if not evidence:
             raise KeyError(f"Unknown evidence: {evidence_id}")
@@ -82,6 +87,8 @@ class AnalysisEngine:
                 start_time=candidate.start_time,
                 end_time=candidate.end_time,
                 source_sha256=reader.hash_range(candidate.start_offset, candidate.size),
+                payload_start_offset=candidate.payload_start_offset,
+                payload_end_offset=candidate.payload_end_offset,
                 notes=candidate.notes,
                 created_at=utc_now(),
             )
@@ -95,20 +102,42 @@ class AnalysisEngine:
             "segments": saved,
             "limitations": [
                 "Physical byte ranges and hashes are recorded for every result.",
+                "Deleted, overwritten, fragmented, and unallocated labels describe the requested recovery posture; they are not proof of storage history without corroborating filesystem or recorder metadata.",
                 "A carved candidate is not proof of deletion, identity, or wall-clock time without corroborating metadata.",
             ],
         }
 
-    def timeline(self, evidence_id: str) -> Dict[str, Any]:
+    def timeline(self, evidence_id: str, tolerance_seconds: float = 2.0) -> Dict[str, Any]:
         evidence = self.store.get_evidence(evidence_id)
         if not evidence:
             raise KeyError(f"Unknown evidence: {evidence_id}")
-        segments = self.store.list_segments(evidence_id)
-        # Indexed timestamps sort first; physical offsets provide a deterministic
-        # order for raw candidates with no clock.
-        segments.sort(key=lambda item: (item.get("start_time") is None, item.get("start_time") or "", item["start_offset"]))
-        return {
+        result = {
             "evidence_id": evidence_id,
-            "segments": segments,
-            "clock_note": "Missing times mean the segment is ordered by physical offset, not assigned a wall-clock timestamp.",
+            **build_timeline(self.store.list_segments(evidence_id), tolerance_seconds),
         }
+        self.store.record_audit(evidence["case_id"], "timeline_normalized", {
+            "evidence_id": evidence_id,
+            "tolerance_seconds": tolerance_seconds,
+            "event_count": len(result["events"]),
+            "correlation_count": len(result["correlations"]),
+        })
+        return result
+
+    def correlate_case(self, case_id: str, tolerance_seconds: float = 2.0) -> Dict[str, Any]:
+        self.store.require_case(case_id)
+        segments = []
+        for evidence in self.store.list_evidence(case_id):
+            segments.extend(self.store.list_segments(evidence["id"]))
+        result = {
+            "case_id": case_id,
+            **build_timeline(segments, tolerance_seconds),
+        }
+        self.store.record_audit(case_id, "cross_camera_correlation", {
+            "tolerance_seconds": tolerance_seconds,
+            "event_count": len(result["events"]),
+            "correlation_count": len(result["correlations"]),
+        })
+        return result
+
+    def analytics(self, segment_id: str, kind: str, model: str = "") -> Dict[str, Any]:
+        return run_analytics(self.store, segment_id, kind, model)

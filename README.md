@@ -14,9 +14,14 @@ operating system.
 
 ## What is implemented
 
-- **Read-only acquisition** — streams an image into case storage while
-  calculating MD5 and SHA-256; the acquired copy is chmod read-only on systems
-  that support it.
+- **Read-only bit-stream acquisition** — streams an image or readable block
+  device into case storage while calculating MD5 and SHA-256; sector size,
+  source kind, acquisition method, and read-only state are persisted. The
+  acquired copy is chmod read-only on systems that support it, and integrity
+  can be re-verified later.
+- **Vendor, model, and firmware identification** — bounded vendor signatures
+  plus evidence-derived model/firmware candidates from ASCII/UTF-16 metadata;
+  candidates are explicitly not hardware attestation.
 - **Vendor and family detection** — bounded signature detection for Hikvision,
   Dahua, Honeywell, CP Plus, Uniview, TP-Link, Godrej, Matrix, plus an honest
   unknown/generic route when no vendor signature is present.
@@ -29,18 +34,29 @@ operating system.
     lead when media bytes are adjacent.
   - CP Plus, Uniview, TP-Link, Godrej, Matrix: signature-only routing to the
     generic recovery tier in this release.
-- **Three recovery postures** — indexed/normal, deleted candidates, and
-  lost/corrupted. Each result retains the source byte offsets, codec hint,
-  recovery state, confidence, physical-range SHA-256, and limitations.
-- **Native evidence export** — copies the exact source range without
+- **Bounded recovery postures** — indexed/normal, deleted, overwritten,
+  fragmented/corrupted, and unallocated-space candidate sweeps. Labels are
+  explicit hypotheses rather than claims about storage history. Each result
+  retains bounded source byte offsets, codec hint, recovery state, confidence,
+  physical-range SHA-256, and limitations.
+- **Native and demuxed evidence export** — copies the exact source range and,
+  where a parser provides offsets, the exact container payload range without
   transcoding. Optional MP4 remuxing is used only when an `ffmpeg` executable
-  is installed; the native artifact is retained alongside it.
+  is installed; native and payload artifacts are retained, hashed, and logged.
+- **Timestamp/correlation workflow** — normalizes known timestamps to UTC with
+  explicit timezone assumptions and correlates events across camera channels
+  only within a configured tolerance. Untimed candidates remain untimed.
+- **Post-acquisition analytics** — motion frame-difference analysis and
+  optional OpenCV face/ONNX object detection run on derived payload artifacts.
+  Missing decoders/models return `not_configured` or `unsupported`; no finding
+  is fabricated, and analytics records retain source and derived hashes.
 - **Chain of custody** — SQLite audit events are hash-linked from a GENESIS
   value. Acquisition, identification, recovery, and report generation are
   recorded and the chain can be verified.
 - **Reports** — JSON, HTML, and a small dependency-free PDF containing the
-  evidence inventory, hashes, recovered ranges, interpretation notes, and
-  audit-chain status.
+  evidence inventory, hashes, physical/payload ranges, normalized timeline,
+  analytics status, audit chain, and a jurisdiction-review checklist. The
+  report never certifies legal admissibility.
 - **Browser workstation and CLI** — both use the same engine and storage
   layer. The web UI is served by Python's standard library HTTP server.
 
@@ -58,8 +74,9 @@ Open <http://localhost:8000>. The browser workflow is:
 1. Create an examination.
 2. Acquire an image from the **Acquire evidence** tab.
 3. Select the source under **Analyze & recover** and run identification.
-4. Choose normal, deleted-candidate, or lost/corrupted recovery.
-5. Download native ranges or generate the report package.
+4. Choose normal, deleted, overwritten, fragmented, or unallocated-space recovery.
+5. Export exact native bytes or a parser-bounded media payload, synchronize the timeline, and run optional analytics.
+6. Verify source hashes and generate the report package.
 
 No source image is included in this repository. The tests use small in-memory
 byte fixtures; they are not claims of field validation against every recorder
@@ -78,7 +95,10 @@ python3 -m forensic_tool --data-dir data acquire ./seized-drive.img --case CASE-
 python3 -m forensic_tool --data-dir data identify EVD-XXXXXXXXXXXX
 python3 -m forensic_tool --data-dir data recover EVD-XXXXXXXXXXXX --mode deleted
 python3 -m forensic_tool --data-dir data timeline EVD-XXXXXXXXXXXX
-python3 -m forensic_tool --data-dir data export SEG-XXXXXXXXXXXX --format native
+python3 -m forensic_tool --data-dir data correlate CASE-XXXXXXXXXX
+python3 -m forensic_tool --data-dir data verify EVD-XXXXXXXXXXXX
+python3 -m forensic_tool --data-dir data export SEG-XXXXXXXXXXXX --format media
+python3 -m forensic_tool --data-dir data analytics SEG-XXXXXXXXXXXX --kind motion
 python3 -m forensic_tool --data-dir data report CASE-XXXXXXXXXX
 ```
 
@@ -95,13 +115,16 @@ The web server exposes a small JSON API used by the UI:
 | `GET` | `/api/health` | Engine health/version |
 | `GET/POST` | `/api/cases` | List or create cases |
 | `GET` | `/api/cases/{case_id}` | Case bundle, evidence, findings, audit |
-| `POST` | `/api/cases/{case_id}/evidence` | Stream raw bytes; pass `X-Filename` |
-| `GET` | `/api/evidence/{evidence_id}` | Source metadata and results |
-| `POST` | `/api/evidence/{evidence_id}/identify` | Run bounded identification |
-| `POST` | `/api/evidence/{evidence_id}/recover` | JSON `{ "mode": "normal" }` |
-| `GET` | `/api/evidence/{evidence_id}/timeline` | Ordered recovered ranges |
-| `GET` | `/api/segments/{segment_id}/export?format=native` | Download exact bytes |
-| `POST` | `/api/cases/{case_id}/report` | Build report artifacts |
+| `POST` | `/api/cases/{case_id}/evidence` | Stream raw bytes; pass `X-Filename`, optional source-kind/sector query metadata |
+| `GET` | `/api/evidence/{evidence_id}` | Source metadata, identification, segments, analytics |
+| `POST` | `/api/evidence/{evidence_id}/identify` | Run bounded vendor/model/firmware identification |
+| `POST` | `/api/evidence/{evidence_id}/recover` | JSON `{ "mode": "normal" }` or deleted/overwritten/fragmented/unallocated |
+| `GET` | `/api/evidence/{evidence_id}/integrity` | Re-hash MD5/SHA-256 and append verification event |
+| `GET` | `/api/evidence/{evidence_id}/timeline` | Normalize one source timeline |
+| `GET` | `/api/cases/{case_id}/timeline` | Cross-camera correlation; optional `?tolerance=2` |
+| `GET` | `/api/segments/{segment_id}/export?format=native|media` | Download exact native or parser-bounded payload |
+| `POST` | `/api/segments/{segment_id}/analytics` | JSON `{ "kind": "motion|object|face", "model": "" }` |
+| `POST` | `/api/cases/{case_id}/report` | Build JSON, HTML, and PDF report artifacts |
 | `GET` | `/api/cases/{case_id}/report.html/.pdf/.json` | Download a report |
 
 The default upload limit is intentionally large for disk images but can be
@@ -119,8 +142,10 @@ SentinelApp ── EvidenceStore (SQLite + immutable byte copies)
      ├── Detector ── vendor profiles and confidence/limitations
      ├── Parser registry ── DHAV / Hikvision / Honeywell / generic routes
      ├── Annex-B carver ── bounded H.264/H.265 physical ranges
-     ├── Exporter ── exact native range, optional ffmpeg remux
-     └── Reporter ── JSON / HTML / PDF + verified custody chain
+     ├── Exporter ── exact native range, parser-bounded payload, optional ffmpeg remux
+     ├── Timeline ── UTC normalization and conservative cross-camera correlation
+     ├── Analytics ── optional motion / object / face adapters with explicit status
+     └── Reporter ── JSON / HTML / PDF + hashes, checklist, verified custody chain
 ```
 
 The `EvidenceReader` uses random-access and chunked reads. It never mounts an
@@ -136,6 +161,9 @@ Run the standard-library test suite from the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-The tests cover cross-chunk signature detection, acquisition hashes, vendor
-routing, bounded DHAV parsing, the three recovery states, exact native export,
-report creation, and tamper detection in the custody chain.
+The tests cover cross-chunk signature detection, acquisition hashes, source
+metadata and migrations, vendor/model/firmware candidates, bounded DHAV
+payload parsing, deleted/overwritten/fragmented/unallocated recovery labels,
+exact native and demuxed export, timestamp correlation, explicit analytics
+availability states, report checklists, and tamper detection in the custody
+chain.

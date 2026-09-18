@@ -1,20 +1,16 @@
-"""Evidence-preserving segment export.
-
-Native export is always available and copies the exact source range.  MP4
-conversion is optional and only attempted through an installed ffmpeg binary;
-the source range remains the primary artifact and is never overwritten.
-"""
+"""Evidence-preserving native, demuxed-payload, and optional MP4 export."""
 
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
-import tempfile
+import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
-from .storage import EvidenceStore, utc_now
+from .storage import EvidenceStore
 
 
 class ExportError(RuntimeError):
@@ -22,7 +18,13 @@ class ExportError(RuntimeError):
 
 
 def _suffix_for(codec: str) -> str:
-    return {"H.264": ".h264", "H.265": ".h265", "MPEG-PS": ".mpg", "DHAV": ".dav"}.get(codec, ".bin")
+    return {
+        "H.264": ".h264",
+        "H.265": ".h265",
+        "MPEG-PS": ".mpg",
+        "DHAV": ".dav",
+        "DHAV-audio": ".audio",
+    }.get(codec, ".bin")
 
 
 def _hash_path(path: Path) -> str:
@@ -33,53 +35,148 @@ def _hash_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _atomic_copy_range(store: EvidenceStore, evidence_id: str, start: int, length: int, destination: Path) -> int:
+    reader = store.evidence_reader(evidence_id)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    copied = 0
+    try:
+        with temporary.open("wb") as output:
+            copied = reader.read_range_to(start, length, output)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            temporary.chmod(0o440)
+        except OSError:
+            pass
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+    return copied
+
+
+def _ensure_native(store: EvidenceStore, evidence: Dict[str, object], segment: Dict[str, object]) -> Dict[str, object]:
+    suffix = _suffix_for(str(segment["codec"]))
+    path = store.export_path(str(evidence["case_id"]), str(segment["id"]), suffix)
+    size = int(segment["size"])
+    if not path.exists() or path.stat().st_size != size:
+        copied = _atomic_copy_range(store, str(evidence["id"]), int(segment["start_offset"]), size, path)
+        if copied != size:
+            raise ExportError("Source ended before the complete segment range was copied")
+    native_hash = _hash_path(path)
+    expected_hash = segment.get("source_sha256")
+    if expected_hash and native_hash != expected_hash:
+        raise ExportError("Native export hash does not match the recorded source-range hash")
+    return {
+        "path": path,
+        "sha256": native_hash,
+        "size": path.stat().st_size,
+        "filename": path.name,
+        "content_type": _content_type(path.suffix),
+    }
+
+
+def _ensure_media(store: EvidenceStore, evidence: Dict[str, object], segment: Dict[str, object], native: Dict[str, object]) -> Dict[str, object]:
+    start = segment.get("payload_start_offset")
+    end = segment.get("payload_end_offset")
+    exact_payload = isinstance(start, int) and isinstance(end, int) and int(end) > int(start)
+    if not exact_payload:
+        start, end = int(segment["start_offset"]), int(segment["end_offset"])
+    suffix = _suffix_for(str(segment["codec"]))
+    path = store.export_path(str(evidence["case_id"]), str(segment["id"]), f".payload{suffix}")
+    size = int(end) - int(start)
+    if not path.exists() or path.stat().st_size != size:
+        copied = _atomic_copy_range(store, str(evidence["id"]), int(start), size, path)
+        if copied != size:
+            raise ExportError("Source ended before the complete media payload was copied")
+    return {
+        "path": path,
+        "sha256": _hash_path(path),
+        "size": path.stat().st_size,
+        "filename": path.name,
+        "content_type": _content_type(path.suffix),
+        "payload_range": {"start_offset": int(start), "end_offset": int(end), "exact": exact_payload},
+        "native_sha256": native["sha256"],
+    }
+
+
 def export_segment(store: EvidenceStore, segment_id: str, output_format: str = "native") -> Dict[str, object]:
+    """Export one recovered range without changing the source evidence.
+
+    ``native`` is the exact physical range. ``media`` strips a known container
+    header/footer when the parser supplied payload offsets. ``mp4`` remuxes the
+    media payload only when ffmpeg is available; native and payload artifacts
+    remain available independently.
+    """
+
     segment = store.get_segment(segment_id)
     if not segment:
         raise KeyError(f"Unknown segment: {segment_id}")
     evidence = store.get_evidence(segment["evidence_id"])
     if not evidence:
         raise KeyError(f"Unknown evidence: {segment['evidence_id']}")
-    if output_format not in {"native", "mp4"}:
-        raise ValueError("output_format must be native or mp4")
+    if output_format not in {"native", "media", "mp4"}:
+        raise ValueError("output_format must be native, media, or mp4")
 
-    native_path = store.export_path(evidence["case_id"], segment_id, _suffix_for(segment["codec"]))
-    if not native_path.exists() or native_path.stat().st_size != segment["size"]:
-        reader = store.evidence_reader(evidence["id"])
-        with native_path.open("wb") as output:
-            copied = reader.read_range_to(segment["start_offset"], segment["size"], output)
-        if copied != segment["size"]:
-            raise ExportError("Source ended before the complete segment range was copied")
-        try:
-            native_path.chmod(0o440)
-        except OSError:
-            pass
-    native_hash = _hash_path(native_path)
+    native = _ensure_native(store, evidence, segment)
     if output_format == "native":
-        return {
+        result = {
             "segment_id": segment_id,
             "format": "native",
-            "path": str(native_path),
-            "filename": native_path.name,
-            "sha256": native_hash,
-            "content_type": _content_type(native_path.suffix),
-            "size": native_path.stat().st_size,
+            "path": str(native["path"]),
+            "filename": native["filename"],
+            "sha256": native["sha256"],
+            "content_type": native["content_type"],
+            "size": native["size"],
             "note": "Exact physical source range copied without transcoding.",
         }
+        return _record_export(store, evidence, result)
+
+    media = _ensure_media(store, evidence, segment, native)
+    if output_format == "media":
+        result = {
+            "segment_id": segment_id,
+            "format": "media",
+            "path": str(media["path"]),
+            "filename": media["filename"],
+            "sha256": media["sha256"],
+            "content_type": media["content_type"],
+            "size": media["size"],
+            "native_sha256": media["native_sha256"],
+            "payload_range": media["payload_range"],
+            "note": (
+                "Parser-bounded container payload copied without transcoding; exact native range is retained separately."
+                if media["payload_range"]["exact"]
+                else "No parser payload boundary was available; the full bounded candidate was copied as media bytes. Exact native range is retained separately."
+            ),
+        }
+        return _record_export(store, evidence, result)
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise ExportError("MP4 export requires ffmpeg; exact native export is available")
-    mp4_path = store.export_path(evidence["case_id"], segment_id, ".mp4")
-    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(native_path), "-map", "0", "-c", "copy", str(mp4_path)]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
-    if completed.returncode != 0 or not mp4_path.exists():
-        raise ExportError(completed.stderr.strip() or "ffmpeg could not remux this native stream")
+        raise ExportError("MP4 export requires ffmpeg; exact native and media exports are available")
+    mp4_path = store.export_path(str(evidence["case_id"]), segment_id, ".mp4")
+    # Keep an .mp4 suffix so ffmpeg selects a container for the temporary
+    # output; it is atomically renamed to the final artifact afterwards.
+    temporary = mp4_path.with_name(f".{mp4_path.stem}.{uuid.uuid4().hex}.mp4")
+    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(media["path"]), "-map", "0", "-c", "copy", str(temporary)]
     try:
-        mp4_path.chmod(0o440)
-    except OSError:
-        pass
-    return {
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
+        if completed.returncode != 0 or not temporary.exists():
+            raise ExportError(completed.stderr.strip() or "ffmpeg could not remux this media payload")
+        try:
+            temporary.chmod(0o440)
+        except OSError:
+            pass
+        os.replace(temporary, mp4_path)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+    return _record_export(store, evidence, {
         "segment_id": segment_id,
         "format": "mp4",
         "path": str(mp4_path),
@@ -87,9 +184,25 @@ def export_segment(store: EvidenceStore, segment_id: str, output_format: str = "
         "sha256": _hash_path(mp4_path),
         "content_type": "video/mp4",
         "size": mp4_path.stat().st_size,
-        "native_sha256": native_hash,
-        "note": "Container remuxed with ffmpeg; native source-range artifact is retained beside it.",
-    }
+        "native_sha256": native["sha256"],
+        "media_sha256": media["sha256"],
+        "note": "Container remuxed with ffmpeg; native and demuxed source artifacts are retained.",
+    })
+
+
+def _record_export(store: EvidenceStore, evidence: Dict[str, object], result: Dict[str, object]) -> Dict[str, object]:
+    """Record derived-artifact creation even when the library is used directly."""
+    store.record_audit(str(evidence["case_id"]), "segment_exported", {
+        "segment_id": result["segment_id"],
+        "format": result["format"],
+        "filename": result["filename"],
+        "sha256": result["sha256"],
+        "size": result["size"],
+        "native_sha256": result.get("native_sha256"),
+        "media_sha256": result.get("media_sha256"),
+        "payload_range": result.get("payload_range"),
+    })
+    return result
 
 
 def _content_type(suffix: str) -> str:
@@ -98,4 +211,5 @@ def _content_type(suffix: str) -> str:
         ".h265": "video/h265",
         ".mpg": "video/mpeg",
         ".dav": "application/octet-stream",
+        ".audio": "application/octet-stream",
     }.get(suffix, "application/octet-stream")

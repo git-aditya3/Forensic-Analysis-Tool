@@ -51,20 +51,36 @@ def build_parser() -> argparse.ArgumentParser:
     acquire.add_argument("--case", required=True, dest="case_id")
     acquire.add_argument("--name", default=None)
     acquire.add_argument("--source", default="disk-image")
+    acquire.add_argument("--source-kind", choices=["disk-image", "physical-disk", "partition", "file", "stream"], default="disk-image")
+    acquire.add_argument("--acquisition-method", choices=["streaming-bitstream-copy", "sector-copy", "file-copy", "logical-export"], default="streaming-bitstream-copy")
+    acquire.add_argument("--sector-size", type=int, default=512)
 
     identify = commands.add_parser("identify", help="detect recorder family and filesystem signatures")
     identify.add_argument("evidence_id")
 
     recover = commands.add_parser("recover", help="parse or carve evidence")
     recover.add_argument("evidence_id")
-    recover.add_argument("--mode", choices=["normal", "deleted", "lost_corrupted"], default="normal")
+    recover.add_argument("--mode", choices=["normal", "deleted", "overwritten", "fragmented", "unallocated", "lost_corrupted"], default="normal")
 
-    timeline = commands.add_parser("timeline", help="show recovered segments in evidence order")
+    timeline = commands.add_parser("timeline", help="normalize recovered timestamps and correlate one evidence item")
     timeline.add_argument("evidence_id")
+    timeline.add_argument("--tolerance", type=float, default=2.0)
 
-    export = commands.add_parser("export", help="copy one segment as native bytes or optional MP4")
+    correlate = commands.add_parser("correlate", help="correlate recovered events across all evidence in a case")
+    correlate.add_argument("case_id")
+    correlate.add_argument("--tolerance", type=float, default=2.0)
+
+    verify = commands.add_parser("verify", help="re-hash acquired evidence and append an integrity event")
+    verify.add_argument("evidence_id")
+
+    analytics = commands.add_parser("analytics", help="run optional post-acquisition media analytics")
+    analytics.add_argument("segment_id")
+    analytics.add_argument("--kind", choices=["motion", "object", "face"], required=True)
+    analytics.add_argument("--model", default="")
+
+    export = commands.add_parser("export", help="copy one segment as exact native, demuxed media, or optional MP4")
     export.add_argument("segment_id")
-    export.add_argument("--format", choices=["native", "mp4"], default="native")
+    export.add_argument("--format", choices=["native", "media", "mp4"], default="native")
 
     report = commands.add_parser("report", help="write JSON, HTML, and PDF report artifacts")
     report.add_argument("case_id")
@@ -88,13 +104,29 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _print(store.case_bundle(args.case_id))
         elif args.command == "acquire":
-            _print(store.ingest_file(args.case_id, args.image, args.name, args.source))
+            _print(
+                store.ingest_file(
+                    args.case_id,
+                    args.image,
+                    args.name,
+                    args.source,
+                    args.source_kind,
+                    args.sector_size,
+                    args.acquisition_method,
+                )
+            )
         elif args.command == "identify":
             _print(AnalysisEngine(store).identify(args.evidence_id))
         elif args.command == "recover":
             _print(AnalysisEngine(store).recover(args.evidence_id, args.mode))
         elif args.command == "timeline":
-            _print(AnalysisEngine(store).timeline(args.evidence_id))
+            _print(AnalysisEngine(store).timeline(args.evidence_id, args.tolerance))
+        elif args.command == "correlate":
+            _print(AnalysisEngine(store).correlate_case(args.case_id, args.tolerance))
+        elif args.command == "verify":
+            _print(store.verify_evidence(args.evidence_id))
+        elif args.command == "analytics":
+            _print(AnalysisEngine(store).analytics(args.segment_id, args.kind, args.model))
         elif args.command == "export":
             _print(export_segment(store, args.segment_id, args.format))
         elif args.command == "report":

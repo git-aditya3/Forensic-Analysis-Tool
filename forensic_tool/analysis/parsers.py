@@ -27,6 +27,8 @@ class Candidate:
     channel: Optional[int] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    payload_start_offset: Optional[int] = None
+    payload_end_offset: Optional[int] = None
     notes: str = ""
 
     @property
@@ -93,8 +95,19 @@ def _carve_candidates(reader: EvidenceReader, mode: str) -> List[Candidate]:
     suffix = {
         "normal": "The bytes are not indexed by a recognised parser.",
         "deleted": "Carved candidate from raw bytes; deletion state is a hypothesis until corroborated by recorder metadata.",
+        "overwritten": "Candidate found in a region that may have been reused; overwritten status is a hypothesis until recorder allocation metadata is available.",
+        "fragmented": "Fragment candidate from raw bytes; physical continuity and wall-clock time are not established.",
         "lost_corrupted": "Fragment candidate from raw bytes; physical continuity and wall-clock time are not established.",
+        "unallocated": "Candidate from a requested unallocated-space sweep; filesystem allocation state is not independently reconstructed.",
     }.get(mode, "Raw bytes carved without an index.")
+    state_for_mode = {
+        "normal": "unindexed",
+        "deleted": "deleted_candidate",
+        "overwritten": "overwritten_candidate",
+        "fragmented": "fragment",
+        "lost_corrupted": "fragment",
+        "unallocated": "unallocated_candidate",
+    }.get(mode, "unindexed")
     candidates: List[Candidate] = []
     for item in carve_annex_b(reader):
         candidates.append(
@@ -102,9 +115,11 @@ def _carve_candidates(reader: EvidenceReader, mode: str) -> List[Candidate]:
                 start_offset=item.start_offset,
                 end_offset=item.end_offset,
                 source="annexb_carve",
-                state={"normal": "unindexed", "deleted": "deleted_candidate", "lost_corrupted": "fragment"}.get(mode, "unindexed"),
+                state=state_for_mode,
                 codec=item.codec,
                 confidence=item.confidence,
+                payload_start_offset=item.start_offset,
+                payload_end_offset=item.end_offset,
                 notes=f"{item.notes} {suffix}",
             )
         )
@@ -195,6 +210,15 @@ class DahuaParser(BaseParser):
                 confidence = 0.78
                 state = "container_candidate"
                 note = "DHAV frame length is plausible but the validation footer is missing or damaged."
+            if mode != "normal":
+                state = {
+                    "deleted": "deleted_candidate",
+                    "overwritten": "overwritten_candidate",
+                    "fragmented": "fragment",
+                    "lost_corrupted": "fragment",
+                    "unallocated": "unallocated_candidate",
+                }.get(mode, state)
+                note += " Recovery mode labels this as a candidate, not a proven storage-history state."
             if end <= offset + 24:
                 continue
 
@@ -213,6 +237,8 @@ class DahuaParser(BaseParser):
                     confidence=confidence,
                     channel=channel if channel < 256 else None,
                     start_time=timestamp,
+                    payload_start_offset=payload_offset,
+                    payload_end_offset=max(payload_offset, end - 8 if footer_valid else end),
                     notes=(
                         f"DHAV type 0x{frame_type:02X}; channel {channel}. "
                         + note

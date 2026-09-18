@@ -31,6 +31,9 @@ class Evidence:
     acquired_at: str
     source: str = "disk-image"
     read_only: bool = True
+    source_kind: str = "disk-image"
+    acquisition_method: str = "streaming-bitstream-copy"
+    sector_size: int = 512
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -84,6 +87,8 @@ class Segment:
     end_time: Optional[str] = None
     source_sha256: Optional[str] = None
     artifact_path: Optional[str] = None
+    payload_start_offset: Optional[int] = None
+    payload_end_offset: Optional[int] = None
     notes: str = ""
     created_at: str = ""
 

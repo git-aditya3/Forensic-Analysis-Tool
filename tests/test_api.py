@@ -83,6 +83,36 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertTrue(bundle["chain"]["valid"])
         self.assertEqual(len(bundle["evidence"][0]["segments"]), 1)
 
+    def test_expansion_endpoints_expose_integrity_timeline_and_analytics_status(self):
+        status, _headers, body = self.request(
+            "/api/cases", "POST", json.dumps({"title": "Expansion API"}).encode(), {"Content-Type": "application/json"}
+        )
+        case_id = json.loads(body)["id"]
+        source = b"HIKVISION@HANGZHOU\x00\x00\x01\x67sps\x00\x00\x01\x65idr"
+        status, _headers, body = self.request(
+            f"/api/cases/{case_id}/evidence?source_kind=partition&sector_size=4096&acquisition_method=sector-copy",
+            "POST", source, {"Content-Type": "application/octet-stream", "X-Filename": "partition.dd"}
+        )
+        self.assertEqual(status, 201)
+        evidence = json.loads(body)
+        self.assertEqual(evidence["source_kind"], "partition")
+        self.assertEqual(evidence["sector_size"], 4096)
+        self.request(f"/api/evidence/{evidence['id']}/identify", "POST", b"")
+        _status, _headers, body = self.request(
+            f"/api/evidence/{evidence['id']}/recover", "POST", b'{"mode":"unallocated"}', {"Content-Type": "application/json"}
+        )
+        segment = json.loads(body)["segments"][0]
+        _status, _headers, body = self.request(f"/api/evidence/{evidence['id']}/verify", "POST", b"")
+        self.assertTrue(json.loads(body)["valid"])
+        _status, _headers, body = self.request(f"/api/cases/{case_id}/timeline?tolerance=3")
+        timeline = json.loads(body)
+        self.assertIn("events", timeline)
+        _status, _headers, body = self.request(
+            f"/api/segments/{segment['id']}/analytics", "POST", b'{"kind":"object"}', {"Content-Type": "application/json"}
+        )
+        analytics = json.loads(body)
+        self.assertIn(analytics["status"], {"not_configured", "unsupported"})
+
 
 if __name__ == "__main__":
     unittest.main()
