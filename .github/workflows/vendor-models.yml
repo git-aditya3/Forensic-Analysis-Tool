@@ -1,0 +1,47 @@
+name: Vendor verified analytics models
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this branch
+        uses: actions/checkout@v4
+        with:
+          ref: arena/01a0b333-forensic-analysis-tool
+          fetch-depth: 1
+
+      - name: Fetch pinned OpenCV Zoo model bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/opencv_zoo"
+          git clone --depth 1 https://github.com/opencv/opencv_zoo.git "$work"
+          git -C "$work" lfs install --local
+          git -C "$work" lfs pull --include='models/object_detection_nanodet/object_detection_nanodet_2022nov.onnx,models/face_detection_yunet/face_detection_yunet_2023mar.onnx'
+          mkdir -p forensic_tool/model_assets
+          cp "$work/models/object_detection_nanodet/object_detection_nanodet_2022nov.onnx" forensic_tool/model_assets/
+          cp "$work/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" forensic_tool/model_assets/
+          test "$(stat -c '%s' forensic_tool/model_assets/object_detection_nanodet_2022nov.onnx)" = 3800954
+          test "$(stat -c '%s' forensic_tool/model_assets/face_detection_yunet_2023mar.onnx)" = 232589
+          test "$(sha256sum forensic_tool/model_assets/object_detection_nanodet_2022nov.onnx | cut -d' ' -f1)" = 4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186
+          test "$(sha256sum forensic_tool/model_assets/face_detection_yunet_2023mar.onnx | cut -d' ' -f1)" = 8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+
+      - name: Commit verified assets to the branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add forensic_tool/model_assets
+          if git diff --cached --quiet; then
+            echo "Verified assets are already present"
+            exit 0
+          fi
+          git commit -m "Vendor verified analytics model assets"
+          git push origin HEAD:arena/01a0b333-forensic-analysis-tool

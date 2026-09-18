@@ -114,6 +114,11 @@ def describe_model(spec: ModelSpec, *, auto_download: bool = True) -> Dict[str, 
     return _metadata(spec, None, "auto_download_on_use" if auto_download else "offline_fallback")
 
 
+def packaged_model_path(spec: ModelSpec) -> Path:
+    """Return the standard-install asset location for a pinned model."""
+    return Path(__file__).resolve().parent.parent / "model_assets" / spec.filename
+
+
 def verify_model_file(spec: ModelSpec, candidate: str | Path) -> tuple[Optional[Path], Dict[str, Any]]:
     """Verify an examiner-supplied path against a pinned model specification.
 
@@ -168,11 +173,23 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
         if verified_path is not None:
             return verified_path, cached_status
         invalid_cache = dict(cached_status, error="Cached model failed the expected size or SHA-256 check; it was not used.")
-        if not auto_download:
-            return None, invalid_cache
+
+    packaged_path, packaged_status = verify_model_file(spec, packaged_model_path(spec))
+    if packaged_path is not None:
+        packaged_provenance = dict(packaged_status, status="packaged", packaged=True)
+        if invalid_cache is not None:
+            packaged_provenance["rejected_cache"] = invalid_cache
+        return packaged_path, packaged_provenance
 
     if not auto_download:
-        return None, _metadata(spec, None, "not_configured", error="Automatic model download is disabled.")
+        if invalid_cache is not None:
+            if packaged_status.get("status") == "invalid":
+                invalid_cache["packaged_asset"] = packaged_status
+            return None, invalid_cache
+        provenance = _metadata(spec, None, "not_configured", error="Automatic model download is disabled.")
+        if packaged_status.get("status") == "invalid":
+            provenance["packaged_asset"] = packaged_status
+        return None, provenance
 
     try:
         root.mkdir(parents=True, exist_ok=True)

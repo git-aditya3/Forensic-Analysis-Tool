@@ -23,4 +23,4 @@ forensic-tool = "forensic_tool.cli:main"
 include = ["forensic_tool*"]
 
 [tool.setuptools.package-data]
-forensic_tool = []
+forensic_tool = ["model_assets/*.onnx"]

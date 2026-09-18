@@ -50,7 +50,7 @@ class ExpansionWorkflowTests(unittest.TestCase):
     def test_model_preflight_reports_both_pinned_assets_without_network(self):
         results = provision_default_models(self.root, auto_download=False)
         self.assertEqual(set(results), {"opencv-zoo-nanodet-coco", "opencv-zoo-yunet-face"})
-        self.assertTrue(all(item["status"] == "not_configured" for item in results.values()))
+        self.assertTrue(all(item["status"] in {"not_configured", "packaged"} for item in results.values()))
         self.assertTrue(all(item["expected_sha256"] for item in results.values()))
 
     def test_verified_model_registry_never_uses_a_corrupt_cache(self):
