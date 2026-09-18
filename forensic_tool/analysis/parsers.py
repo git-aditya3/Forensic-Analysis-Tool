@@ -48,6 +48,28 @@ def _iso_timestamp(value: int, milliseconds: bool = True) -> Optional[str]:
         return None
 
 
+def _dhav_date_to_iso(date_value: int, milliseconds: int = 0) -> Optional[str]:
+    """Decode the packed 32-bit DHAV date used by FFmpeg's demuxer."""
+
+    second = date_value & 0x3F
+    minute = (date_value >> 6) & 0x3F
+    hour = (date_value >> 12) & 0x1F
+    day = (date_value >> 17) & 0x1F
+    month = (date_value >> 22) & 0x0F
+    year = ((date_value >> 26) & 0x3F) + 2000
+    if not (2000 <= year <= 2063 and 1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60 and second < 60):
+        return None
+    try:
+        value = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        # DHAV's 16-bit timestamp is a sub-second counter on common variants;
+        # preserve it only when it is a plausible millisecond value.
+        if 0 <= milliseconds < 1000:
+            value = value.replace(microsecond=milliseconds * 1000)
+        return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except ValueError:
+        return None
+
+
 def _next_marker(reader: EvidenceReader, markers: Sequence[int], current: int, default_tail: int = 4 * 1024 * 1024) -> int:
     for offset in markers:
         if offset > current:
@@ -113,67 +135,89 @@ class DahuaParser(BaseParser):
             {"upper": b"DHAV", "lower": b"dhav"},
             max_hits=100_000,
         )
-        offsets = sorted(set(found["upper"] + found["lower"]))
+        offsets = sorted(found["upper"])
         headers = reader.read_many(offsets, 64)
+        # Resolve all footer checks with one open/read pass instead of opening
+        # the evidence file once per DHAV frame.
+        footer_offsets: List[int] = []
+        for index, offset in enumerate(offsets):
+            header = headers.get(offset, b"")
+            if len(header) < 24:
+                continue
+            frame_length = struct.unpack_from("<I", header, 12)[0]
+            next_magic = offsets[index + 1] if index + 1 < len(offsets) else reader.size
+            declared_end = offset + frame_length
+            if 32 <= frame_length <= min(256 * 1024 * 1024, reader.size - offset) and next_magic >= declared_end:
+                footer_offsets.append(declared_end - 8)
+        footers = reader.read_many(footer_offsets, 4)
         candidates: List[Candidate] = []
         for index, offset in enumerate(offsets):
             header = headers.get(offset, b"")
-            if len(header) < 16:
+            if len(header) < 24:
                 continue
-            # The common DHAV family stores a bounded block length near the
-            # magic.  Firmware variants move it, so evaluate little and big
-            # endian candidates at offsets 4, 8, and 12 and choose the first
-            # physically plausible one.
-            length = None
-            for field_offset in (4, 8, 12, 16):
-                if field_offset + 4 > len(header):
-                    continue
-                for endian in ("<", ">"):
-                    value = struct.unpack_from(f"{endian}I", header, field_offset)[0]
-                    if 32 <= value <= min(256 * 1024 * 1024, reader.size - offset):
-                        # A length at offset 4 is strongly preferred; other
-                        # fields are accepted only when the next magic agrees.
-                        if length is None or field_offset < length[1]:
-                            length = (value, field_offset)
+
+            frame_type = header[4]
+            channel = int(header[6])
+            frame_length = struct.unpack_from("<I", header, 12)[0]
+            packed_date = struct.unpack_from("<I", header, 16)[0]
+            timestamp_ms = struct.unpack_from("<H", header, 20)[0]
+            extension_length = header[22]
             next_magic = offsets[index + 1] if index + 1 < len(offsets) else reader.size
-            if length:
-                end = min(reader.size, offset + length[0])
-                confidence = 0.90 if length[1] == 4 else 0.78
-                note = "Bounded DHAV-family block with a plausible length field."
+
+            # DHAV's current/common frame layout is:
+            # magic, type/subtype, channel/subchannel, frame number, total
+            # frame length, packed date, 16-bit sub-second timestamp, extension
+            # length/checksum, payload, and an eight-byte footer beginning with
+            # lowercase ``dhav``.  Validate both the declared range and footer
+            # when present; a damaged/deleted frame may still be returned as a
+            # bounded candidate without the footer.
+            declared_end = offset + frame_length
+            length_valid = 32 <= frame_length <= min(256 * 1024 * 1024, reader.size - offset)
+            # A subsequent DHAV header before the declared end is strong
+            # evidence that the length field was damaged or belongs to a
+            # different firmware layout.  Do not let that frame consume its
+            # neighbours.
+            length_conflict = length_valid and next_magic < declared_end
+            length_valid = length_valid and not length_conflict
+            end = declared_end if length_valid else min(next_magic, offset + 4 * 1024 * 1024)
+            footer_valid = False
+            if length_valid and end - offset >= 8:
+                footer_valid = footers.get(end - 8, b"") == b"dhav"
+            if not length_valid:
+                confidence = 0.48
+                state = "container_candidate"
+                note = "DHAV marker found without a trusted frame length; bounded to the next marker."
+            elif footer_valid:
+                confidence = 0.96
+                state = "indexed"
+                note = "DHAV frame length and lowercase footer validated."
             else:
-                end = min(next_magic, offset + 4 * 1024 * 1024)
-                confidence = 0.55
-                note = "DHAV marker found but no trusted length field; bounded to the next marker."
-            if end <= offset + 32:
+                confidence = 0.78
+                state = "container_candidate"
+                note = "DHAV frame length is plausible but the validation footer is missing or damaged."
+            if end <= offset + 24:
                 continue
-            payload_offset = min(end, offset + 32)
+
+            payload_offset = min(end, offset + 24 + extension_length)
             codec = detect_codec(reader, payload_offset, min(64 * 1024, end - payload_offset))
             if codec == "unknown":
-                codec = "DHAV"
-            channel = None
-            timestamp = None
-            # This is the most common compact testable layout: channel at 8,
-            # Unix milliseconds at 12.  Sanity checks prevent random bytes
-            # from becoming a camera number or a date.
-            if len(header) >= 12:
-                possible_channel = struct.unpack_from("<I", header, 8)[0]
-                if possible_channel < 256:
-                    channel = int(possible_channel)
-            if len(header) >= 20:
-                raw_timestamp = struct.unpack_from("<Q", header, 12)[0]
-                timestamp = _iso_timestamp(raw_timestamp, milliseconds=True) or _iso_timestamp(raw_timestamp, milliseconds=False)
+                codec = "DHAV-audio" if frame_type in {0xF0, 0xF1} else "DHAV"
+            timestamp = _dhav_date_to_iso(packed_date, timestamp_ms)
             candidates.append(
                 Candidate(
                     start_offset=offset,
                     end_offset=end,
                     source="dhav_parser",
-                    state="indexed" if length else "container_candidate",
+                    state=state,
                     codec=codec,
                     confidence=confidence,
-                    channel=channel,
+                    channel=channel if channel < 256 else None,
                     start_time=timestamp,
-                    notes=note
-                    + " Container metadata is preserved as found; the parser does not claim to decode every firmware variant.",
+                    notes=(
+                        f"DHAV type 0x{frame_type:02X}; channel {channel}. "
+                        + note
+                        + " Frame metadata is preserved as found; firmware-specific extensions are not decoded."
+                    ),
                 )
             )
         return candidates

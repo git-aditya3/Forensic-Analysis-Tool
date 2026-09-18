@@ -43,6 +43,7 @@ PROFILES: Tuple[VendorProfile, ...] = (
         "DHFS / DHAV",
         "dahua_dhav",
         (
+            ("DAHUA", b"DAHUA", 0.95),
             ("DHFS", b"DHFS", 0.97),
             ("DHAV", b"DHAV", 0.91),
             ("dhav", b"dhav", 0.82),

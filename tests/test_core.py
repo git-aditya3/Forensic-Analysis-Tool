@@ -75,10 +75,22 @@ class CoreSystemTests(unittest.TestCase):
 
     def test_dahua_bounded_block_parser(self):
         payload = annex_b_stream()
-        timestamp_ms = 1700000000000
-        block_size = 32 + len(payload)
-        header = b"DHAV" + struct.pack("<I", block_size) + struct.pack("<I", 3) + struct.pack("<Q", timestamp_ms) + b"\0" * 12
-        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(b"DHFS4.1" + header + payload), "dahua.dav")
+        # Common DHAV layout: type/subtype, channel/subchannel, frame number,
+        # total frame length, packed date, sub-second timestamp, extension,
+        # checksum, payload, and an eight-byte validation footer.
+        packed_date = ((2023 - 2000) << 26) | (11 << 22) | (14 << 17) | (12 << 12) | (30 << 6) | 15
+        frame_size = 24 + len(payload) + 8
+        header = (
+            b"DHAV"
+            + bytes([0xFD, 0x00, 3, 0])
+            + struct.pack("<I", 7)
+            + struct.pack("<I", frame_size)
+            + struct.pack("<I", packed_date)
+            + struct.pack("<H", 250)
+            + b"\x00\x00"
+        )
+        footer = b"dhav" + struct.pack("<I", frame_size)
+        evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(b"DHFS4.1" + header + payload + footer), "dahua.dav")
         identity = self.engine.identify(evidence["id"])
         self.assertEqual(identity["primary_vendor"], "dahua")
         result = self.engine.recover(evidence["id"], "normal")
