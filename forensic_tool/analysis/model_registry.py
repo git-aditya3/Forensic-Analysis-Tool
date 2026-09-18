@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.request import Request, urlopen
 
+from ..security import ensure_private_dir, harden_file
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -111,7 +113,9 @@ def _metadata(spec: ModelSpec, path: Optional[Path], status: str, **extra: Any) 
         "status": status,
     }
     if path is not None:
-        value["path"] = str(path)
+        # Provenance is exposed in reports and the HTTP API; retain the asset
+        # name without disclosing the host's private filesystem layout.
+        value["path"] = path.name
     value.update(extra)
     return value
 
@@ -199,7 +203,7 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
         return None, provenance
 
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(root)
     except Exception as error:
         return None, _metadata(spec, None, "unavailable", error=str(error))
 
@@ -233,6 +237,7 @@ def resolve_model(spec: ModelSpec, store_root: str | Path, *, auto_download: Opt
             except OSError:
                 pass
             os.replace(temporary_name, path)
+            harden_file(path, 0o440)
             return path, _metadata(
                 spec,
                 path,

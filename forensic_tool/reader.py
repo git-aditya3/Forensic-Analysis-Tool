@@ -7,8 +7,10 @@ filesystem mounting, partition writing, or automatic repair in this module.
 from __future__ import annotations
 
 import hashlib
+import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Generator, Iterable, List, Mapping, Tuple, Union
+from typing import BinaryIO, Dict, Generator, Iterable, List, Mapping, Tuple, Union
 
 
 PathLike = Union[str, Path]
@@ -19,9 +21,19 @@ class EvidenceReader:
 
     def __init__(self, path: PathLike):
         self.path = Path(path)
-        if not self.path.is_file():
+        if self.path.is_symlink() or not self.path.is_file():
             raise FileNotFoundError(f"Evidence file not found: {self.path}")
         self.size = self.path.stat().st_size
+
+    @contextmanager
+    def _open_read(self) -> Generator[BinaryIO, None, None]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.path, flags)
+        stream = os.fdopen(descriptor, "rb")
+        try:
+            yield stream
+        finally:
+            stream.close()
 
     def read_at(self, offset: int, length: int) -> bytes:
         if offset < 0:
@@ -29,7 +41,7 @@ class EvidenceReader:
         if length <= 0 or offset >= self.size:
             return b""
         length = min(length, self.size - offset)
-        with self.path.open("rb") as handle:
+        with self._open_read() as handle:
             handle.seek(offset)
             return handle.read(length)
 
@@ -40,7 +52,7 @@ class EvidenceReader:
 
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        with self.path.open("rb") as handle:
+        with self._open_read() as handle:
             offset = 0
             while True:
                 chunk = handle.read(chunk_size)
@@ -129,7 +141,7 @@ class EvidenceReader:
             return {offset: b"" for offset in offsets}
         requested = sorted({offset for offset in offsets if 0 <= offset < self.size})
         values: Dict[int, bytes] = {}
-        with self.path.open("rb") as handle:
+        with self._open_read() as handle:
             for offset in requested:
                 handle.seek(offset)
                 values[offset] = handle.read(min(length, self.size - offset))
@@ -142,7 +154,7 @@ class EvidenceReader:
             raise ValueError("invalid range")
         remaining = min(length, self.size - offset)
         digest = hashlib.sha256()
-        with self.path.open("rb") as handle:
+        with self._open_read() as handle:
             handle.seek(offset)
             while remaining:
                 block = handle.read(min(chunk_size, remaining))
@@ -159,7 +171,7 @@ class EvidenceReader:
             raise ValueError("invalid range")
         remaining = min(length, self.size - offset)
         copied = 0
-        with self.path.open("rb") as handle:
+        with self._open_read() as handle:
             handle.seek(offset)
             while remaining:
                 block = handle.read(min(chunk_size, remaining))

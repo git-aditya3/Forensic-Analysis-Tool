@@ -8,10 +8,10 @@ case/evidence identifier rather than a user-supplied path.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
-import shutil
 import sqlite3
 import threading
 import uuid
@@ -23,6 +23,14 @@ from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Optional
 from .hashing import hash_file, hash_stream
 from .imaging import AcquisitionPlan, open_source_read_only
 from .models import AuditEvent, Case, Evidence, Identification, Segment, VendorHit
+from .security import (
+    PRIVATE_FILE_MODE,
+    atomic_write,
+    contained_path,
+    ensure_private_dir,
+    harden_file,
+    open_exclusive,
+)
 
 
 SCHEMA = """
@@ -105,9 +113,20 @@ CREATE TABLE IF NOT EXISTS audit_log (
     occurred_at TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     previous_hash TEXT NOT NULL,
-    event_hash TEXT NOT NULL
+    event_hash TEXT NOT NULL,
+    event_mac TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_case ON audit_log(case_id, id);
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update
+BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit log is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
+BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit log is append-only');
+END;
 """
 
 
@@ -119,6 +138,12 @@ def _safe_name(value: str) -> str:
     value = Path(value or "evidence.img").name
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
     return (value or "evidence.img")[:180]
+
+
+def _safe_component(value: str, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise ValueError(f"invalid {label}")
+    return value
 
 
 def _row_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -135,17 +160,53 @@ class EvidenceStore:
         self.reports_dir = self.root / "reports"
         self.db_path = self.root / "sentinel.sqlite3"
         self._lock = threading.RLock()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.evidence_dir.mkdir(parents=True, exist_ok=True)
-        self.exports_dir.mkdir(parents=True, exist_ok=True)
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.root)
+        ensure_private_dir(self.evidence_dir)
+        ensure_private_dir(self.exports_dir)
+        ensure_private_dir(self.reports_dir)
+        if self.db_path.is_symlink():
+            raise ValueError("refusing symlinked case database")
+        self.audit_key, self.audit_key_source = self._load_audit_key()
         self._initialize()
+        if self.db_path.exists():
+            harden_file(self.db_path)
+
+    def _load_audit_key(self) -> tuple[bytes, str]:
+        """Load a custody MAC key from an external secret or private key file."""
+
+        configured = os.environ.get("SENTINEL_AUDIT_KEY", "").strip()
+        if configured:
+            encoded = configured.encode("utf-8")
+            if len(encoded) < 32:
+                raise ValueError("SENTINEL_AUDIT_KEY must contain at least 32 bytes")
+            return encoded, "environment"
+        key_path = self.root / ".audit-key"
+        if key_path.is_symlink():
+            raise ValueError("refusing symlinked audit key")
+        if key_path.is_file():
+            key = key_path.read_bytes()
+            if len(key) >= 32:
+                harden_file(key_path)
+                return key, "private-key-file"
+        key = os.urandom(32)
+        atomic_write(key_path, key, PRIVATE_FILE_MODE)
+        return key, "private-key-file"
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA secure_delete = ON")
+        try:
+            connection.execute("PRAGMA trusted_schema = OFF")
+        except sqlite3.DatabaseError:
+            pass
+        harden_file(self.db_path)
+        harden_file(Path(str(self.db_path) + "-wal"))
+        harden_file(Path(str(self.db_path) + "-shm"))
         return connection
 
     def _initialize(self) -> None:
@@ -169,6 +230,7 @@ class EvidenceStore:
                     "payload_end_offset": "INTEGER",
                 },
             )
+            self._ensure_columns(connection, "audit_log", {"event_mac": "TEXT NOT NULL DEFAULT ''"})
 
     @staticmethod
     def _ensure_columns(connection: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
@@ -193,6 +255,8 @@ class EvidenceStore:
 
     # ---- cases ---------------------------------------------------------
     def create_case(self, title: str, investigator: str = "", notes: str = "") -> Dict[str, Any]:
+        if not isinstance(title, str) or not isinstance(investigator, str) or not isinstance(notes, str):
+            raise ValueError("case title, investigator, and notes must be strings")
         title = (title or "Untitled examination").strip()[:240]
         case = Case(
             id=f"CASE-{uuid.uuid4().hex[:10].upper()}",
@@ -276,10 +340,10 @@ class EvidenceStore:
         evidence_id = f"EVD-{uuid.uuid4().hex[:12].upper()}"
         safe_name = _safe_name(original_name)
         case_dir = self.evidence_dir / case_id
-        case_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(case_dir)
         destination = case_dir / f"{evidence_id}_{safe_name}"
         try:
-            with destination.open("wb") as output:
+            with open_exclusive(destination, PRIVATE_FILE_MODE) as output:
                 digest = hash_stream(_TeeReader(stream, output))
                 output.flush()
                 os.fsync(output.fileno())
@@ -346,7 +410,11 @@ class EvidenceStore:
         result = _row_dict(row)
         if result:
             result["read_only"] = bool(result["read_only"])
-            result["absolute_path"] = str((self.root / result["storage_path"]).resolve())
+            raw_path = self.root / str(result["storage_path"])
+            if raw_path.is_symlink() or any(parent.is_symlink() for parent in raw_path.parents if parent != self.root):
+                raise ValueError("evidence storage path must not use a symlink")
+            resolved = contained_path(self.root, raw_path)
+            result["absolute_path"] = str(resolved)
         return result
 
     def list_evidence(self, case_id: str) -> List[Dict[str, Any]]:
@@ -390,6 +458,14 @@ class EvidenceStore:
         }
         if record:
             self.record_audit(evidence["case_id"], "evidence_integrity_verified", result)
+        return result
+
+    def require_intact_evidence(self, evidence_id: str) -> Dict[str, Any]:
+        """Refuse interpretation of an acquired copy that changed after ingest."""
+
+        result = self.verify_evidence(evidence_id, record=True)
+        if not result["valid"]:
+            raise ValueError("Acquired evidence failed its recorded hash check; analysis was refused")
         return result
 
     # ---- analysis result persistence ----------------------------------
@@ -637,10 +713,15 @@ class EvidenceStore:
         ).fetchone()
         previous_hash = row["event_hash"] if row else "GENESIS"
         event_hash = hashlib.sha256((previous_hash + payload_json).encode("utf-8")).hexdigest()
+        event_mac = hmac.new(
+            self.audit_key,
+            (case_id + previous_hash + event_hash + payload_json).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
         cursor = connection.execute(
-            """INSERT INTO audit_log(case_id,action,actor,occurred_at,payload_json,previous_hash,event_hash)
-               VALUES(?,?,?,?,?,?,?)""",
-            (case_id, action, actor, occurred_at, payload_json, previous_hash, event_hash),
+            """INSERT INTO audit_log(case_id,action,actor,occurred_at,payload_json,previous_hash,event_hash,event_mac)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (case_id, action, actor, occurred_at, payload_json, previous_hash, event_hash, event_mac),
         )
         return AuditEvent(
             id=int(cursor.lastrowid),
@@ -651,6 +732,7 @@ class EvidenceStore:
             payload=payload,
             previous_hash=previous_hash,
             event_hash=event_hash,
+            event_mac=event_mac,
         )
 
     def record_audit(self, case_id: str, action: str, details: Dict[str, Any], actor: str = "examiner") -> Dict[str, Any]:
@@ -673,14 +755,33 @@ class EvidenceStore:
     def verify_chain(self, case_id: str) -> Dict[str, Any]:
         events = self.audit_events(case_id)
         previous = "GENESIS"
+        authenticated = True
         for event in events:
-            expected = hashlib.sha256(
-                (previous + json.dumps(event["payload"], sort_keys=True, separators=(",", ":"))).encode("utf-8")
+            payload_json = json.dumps(event["payload"], sort_keys=True, separators=(",", ":"))
+            expected = hashlib.sha256((previous + payload_json).encode("utf-8")).hexdigest()
+            expected_mac = hmac.new(
+                self.audit_key,
+                (case_id + previous + expected + payload_json).encode("utf-8"),
+                hashlib.sha256,
             ).hexdigest()
             if event["previous_hash"] != previous or event["event_hash"] != expected:
-                return {"valid": False, "event_count": len(events), "broken_event_id": event["id"]}
+                return {"valid": False, "authenticated": False, "authentication": "failed", "event_count": len(events), "broken_event_id": event["id"]}
+            event_mac = str(event.get("event_mac") or "")
+            if not event_mac:
+                # Databases created before custody MACs were introduced can
+                # still be structurally verified, but are explicitly marked as
+                # legacy rather than presented as tamper-authenticated.
+                authenticated = False
+            elif not hmac.compare_digest(event_mac, expected_mac):
+                return {"valid": False, "authenticated": False, "authentication": "failed", "event_count": len(events), "broken_event_id": event["id"]}
             previous = event["event_hash"]
-        return {"valid": True, "event_count": len(events), "head": previous}
+        return {
+            "valid": True,
+            "authenticated": authenticated,
+            "authentication": "hmac-sha256" if authenticated else "legacy-hash-only",
+            "event_count": len(events),
+            "head": previous,
+        }
 
     # ---- reports and export paths -------------------------------------
     def case_bundle(self, case_id: str) -> Dict[str, Any]:
@@ -696,13 +797,20 @@ class EvidenceStore:
         return {"case": case, "evidence": evidence, "audit": self.audit_events(case_id), "chain": self.verify_chain(case_id)}
 
     def export_path(self, case_id: str, segment_id: str, suffix: str) -> Path:
-        directory = self.exports_dir / case_id
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{segment_id}{suffix}"
+        case_component = _safe_component(case_id, "case identifier")
+        segment_component = _safe_component(segment_id, "segment identifier")
+        if not isinstance(suffix, str) or not re.fullmatch(r"(?:\.payload)?\.[A-Za-z0-9]+", suffix):
+            raise ValueError("invalid export suffix")
+        directory = self.exports_dir / case_component
+        ensure_private_dir(directory)
+        return directory / f"{segment_component}{suffix}"
 
     def report_path(self, case_id: str, suffix: str) -> Path:
-        directory = self.reports_dir / case_id
-        directory.mkdir(parents=True, exist_ok=True)
+        case_component = _safe_component(case_id, "case identifier")
+        if not isinstance(suffix, str) or not re.fullmatch(r"\.[A-Za-z0-9]+", suffix):
+            raise ValueError("invalid report suffix")
+        directory = self.reports_dir / case_component
+        ensure_private_dir(directory)
         return directory / f"forensic-report{suffix}"
 
 

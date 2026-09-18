@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Dict
 
+from .security import ensure_private_dir, open_exclusive
 from .storage import EvidenceStore
 
 
@@ -58,7 +59,7 @@ def _atomic_copy_range(store: EvidenceStore, evidence_id: str, start: int, lengt
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     copied = 0
     try:
-        with temporary.open("wb") as output:
+        with open_exclusive(temporary, 0o600) as output:
             copied = reader.read_range_to(start, length, output)
             output.flush()
             os.fsync(output.fileno())
@@ -179,7 +180,29 @@ def export_segment(store: EvidenceStore, segment_id: str, output_format: str = "
     # Keep an .mp4 suffix so ffmpeg selects a container for the temporary
     # output; it is atomically renamed to the final artifact afterwards.
     temporary = mp4_path.with_name(f".{mp4_path.stem}.{uuid.uuid4().hex}.mp4")
-    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(media["path"]), "-map", "0", "-c", "copy", str(temporary)]
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-timelimit",
+        "300",
+        "-max_alloc",
+        "268435456",
+        "-i",
+        str(media["path"]),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        str(temporary),
+    ]
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
         if completed.returncode != 0 or not temporary.exists():

@@ -9,6 +9,7 @@ acquired copy, and record the sector geometry and hash inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from stat import S_ISBLK, S_ISREG
 from typing import BinaryIO
@@ -37,7 +38,8 @@ class AcquisitionPlan:
 def open_source_read_only(path: str | Path) -> BinaryIO:
     """Open an image/device without requesting write access."""
 
-    source = Path(path).expanduser()
-    if not source.exists() or not (S_ISREG(source.stat().st_mode) or S_ISBLK(source.stat().st_mode)):
+    source = Path(path).expanduser().resolve(strict=True)
+    if not (S_ISREG(source.stat().st_mode) or S_ISBLK(source.stat().st_mode)):
         raise FileNotFoundError(f"Source file or block device not found: {source}")
-    return source.open("rb")
+    descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    return os.fdopen(descriptor, "rb")

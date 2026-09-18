@@ -83,11 +83,22 @@ has network access; no model path needs to be supplied.
 
 ```bash
 python3 -m pip install -e .
-# Start the local workstation. Bind to 0.0.0.0 for a LAN/container preview.
-python3 -m forensic_tool --data-dir data serve --host 0.0.0.0 --port 8000
+# Secure default: loopback-only HTTP with a generated bearer token.
+python3 -m forensic_tool --data-dir data serve --port 8000
 ```
 
-Open <http://localhost:8000>. The browser workflow is:
+The command prints a high-entropy API token. Local browsers receive a
+SameSite/HttpOnly session cookie automatically; API clients must send
+`Authorization: Bearer <token>`. For a container or preview that is already
+protected by a trusted TLS proxy, explicitly opt in to a non-loopback bind:
+
+```bash
+python3 -m forensic_tool --data-dir data serve --host 0.0.0.0 \
+  --allow-insecure-network --port 8000
+```
+
+Do not expose the plain HTTP listener directly to an untrusted network. Open
+<http://localhost:8000>. The browser workflow is:
 
 1. Create an examination.
 2. Acquire an image from the **Acquire evidence** tab.
@@ -169,17 +180,59 @@ reported as invalid and cannot produce findings.
 - Set `SENTINEL_AUTO_DOWNLOAD_MODELS=0` for an offline lab. The deterministic
   fallbacks remain available and the result says exactly which model was not
   used. Set `SENTINEL_MODEL_DIR` to a controlled, pre-approved model cache.
-- Analytics processes the complete bounded segment by default. Set
-  `SENTINEL_ANALYTICS_MAX_FRAMES` to a positive value only when an examiner
-  deliberately wants a resource cap.
+- Analytics examines at most 10,000 frames by default and rejects decoded
+  frames above the configured 8K/pixel safety limit. Set
+  `SENTINEL_ANALYTICS_MAX_FRAMES` to a positive lower value for a tighter
+  resource cap; an explicit zero requests whole-segment processing only in a
+  controlled lab.
 
 Face results intentionally remain detection/index records. Sentinel does not
 perform face recognition, name a person, or make a biometric identity claim.
 That boundary is deliberate for forensic accuracy and privacy.
 
+## Security and data-protection defaults
+
+Sentinel cannot honestly promise to be literally non-hackable; host compromise,
+malicious hardware, vulnerable third-party decoders, and stolen credentials are
+outside a Python application’s control. The implementation does enforce
+several defensive boundaries:
+
+- The CLI binds to `127.0.0.1` by default and refuses non-loopback HTTP unless
+  `--allow-insecure-network` is explicitly supplied. Use a TLS reverse proxy
+  for remote access.
+- Every API route requires a generated or explicitly supplied bearer token.
+  Local browser bootstrapping uses an HttpOnly, SameSite session cookie plus a
+  separate CSRF token for state-changing requests. No permissive CORS policy is
+  enabled.
+- Responses include CSP, `nosniff`, frame, referrer, cross-origin, and
+  permissions protections. Filesystem paths are not returned through the HTTP
+  evidence API.
+- Request bodies reject chunked transfer encoding, enforce JSON and upload
+  size limits, use bounded concurrent connections, and apply socket timeouts.
+- Case directories and SQLite/WAL/artifact files are created with private
+  permissions where supported. Evidence/artifact writes use exclusive,
+  no-follow or atomic creation to reduce symlink/race attacks.
+- Acquired evidence is re-hashed before identification and recovery. A changed
+  source is refused rather than analyzed as if it were the original.
+- Custody events retain the historical hash chain and now also carry a keyed
+  MAC. Set `SENTINEL_AUDIT_KEY` from a secret manager or protected environment
+  when the chain must remain verifiable even if the SQLite file is copied and
+  edited. Legacy chains are reported as structurally valid but not
+  MAC-authenticated.
+- FFmpeg is invoked without a shell and analytics/remux inputs are generated
+  inside the private case store. Native evidence remains read-only and model
+  files remain SHA-256 pinned.
+
+Use OS disk encryption, a write blocker, least-privilege service accounts,
+regular offline backups, and a TLS reverse proxy as part of the operational
+security boundary. The application does not encrypt acquired evidence itself;
+that belongs at the volume/key-management layer so the tool never invents a
+cryptographic file format for court evidence.
+
 ## API surface
 
-The web server exposes a small JSON API used by the UI:
+The web server exposes a small JSON API used by the UI. API calls require a
+bearer token unless they use the local browser session cookie:
 
 | Method | Route | Purpose |
 | --- | --- | --- |

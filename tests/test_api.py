@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -18,7 +19,11 @@ class ApiWorkflowTests(unittest.TestCase):
         self._previous_auto_models = os.environ.get("SENTINEL_AUTO_DOWNLOAD_MODELS")
         os.environ["SENTINEL_AUTO_DOWNLOAD_MODELS"] = "0"
         self.temp = tempfile.TemporaryDirectory()
-        self.app = SentinelApp(Path(self.temp.name) / "data", static_dir=Path(__file__).parents[1] / "static")
+        self.app = SentinelApp(
+            Path(self.temp.name) / "data",
+            static_dir=Path(__file__).parents[1] / "static",
+            auth_token="unit-test-token-0123456789abcdef0123456789abcdef",
+        )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), SentinelHandler)
         self.server.sentinel_app = self.app
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -36,9 +41,37 @@ class ApiWorkflowTests(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, path: str, method: str = "GET", body: bytes | None = None, headers: dict | None = None):
-        request = urllib.request.Request(self.base + path, data=body, method=method, headers=headers or {})
+        request_headers = dict(headers or {})
+        request_headers.setdefault("Authorization", f"Bearer {self.app.auth_token}")
+        request = urllib.request.Request(self.base + path, data=body, method=method, headers=request_headers)
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, response.headers, response.read()
+
+    def test_api_requires_authentication_and_sets_security_headers(self):
+        request = urllib.request.Request(self.base + "/api/cases", method="GET")
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(context.exception.code, 401)
+        self.assertEqual(context.exception.headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("Bearer", context.exception.headers["WWW-Authenticate"])
+
+        status, headers, _body = self.request("/", "GET")
+        self.assertEqual(status, 200)
+        self.assertTrue(any("sentinel_auth=" in item for item in (headers.get_all("Set-Cookie") or [])))
+        self.assertIn("Content-Security-Policy", headers)
+
+        cookie_request = urllib.request.Request(
+            self.base + "/api/cases",
+            method="POST",
+            data=b"{}",
+            headers={
+                "Cookie": f"sentinel_auth={self.app.auth_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(cookie_request, timeout=10)
+        self.assertEqual(context.exception.code, 403)
 
     def test_browser_workflow_acquire_identify_recover_and_export(self):
         status, _headers, body = self.request(
@@ -62,7 +95,9 @@ class ApiWorkflowTests(unittest.TestCase):
             {"Content-Type": "application/octet-stream", "X-Filename": "camera.img"},
         )
         self.assertEqual(status, 201)
-        evidence_id = json.loads(body)["id"]
+        evidence_response = json.loads(body)
+        self.assertNotIn("absolute_path", evidence_response)
+        evidence_id = evidence_response["id"]
 
         status, _headers, body = self.request(f"/api/evidence/{evidence_id}/identify", "POST", b"")
         self.assertEqual(status, 200)

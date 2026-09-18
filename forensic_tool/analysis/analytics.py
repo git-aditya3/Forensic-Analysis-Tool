@@ -25,14 +25,26 @@ from .model_registry import COCO_LABELS, FACE_MODEL, OBJECT_MODEL, describe_mode
 
 
 KINDS = {"motion", "object", "face"}
+_DEFAULT_MAX_FRAMES = 10_000
+_MAX_DECODE_WIDTH = 8_192
+_MAX_DECODE_HEIGHT = 8_192
+_MAX_DECODE_PIXELS = 33_177_600
 
 
 def _frame_limit() -> int:
-    """Return an explicit safety cap; zero means process the whole segment."""
+    """Return a safety cap; an explicit zero still means whole segment."""
     try:
-        return max(0, int(os.environ.get("SENTINEL_ANALYTICS_MAX_FRAMES", "0")))
+        return max(0, int(os.environ.get("SENTINEL_ANALYTICS_MAX_FRAMES", str(_DEFAULT_MAX_FRAMES))))
     except ValueError:
-        return 0
+        return _DEFAULT_MAX_FRAMES
+
+
+def _safe_dimensions(width: int, height: int) -> bool:
+    return (
+        1 <= width <= _MAX_DECODE_WIDTH
+        and 1 <= height <= _MAX_DECODE_HEIGHT
+        and width * height <= _MAX_DECODE_PIXELS
+    )
 
 
 def _ffmpeg_info() -> Dict[str, Any]:
@@ -45,7 +57,7 @@ def _ffmpeg_info() -> Dict[str, Any]:
         path = imageio_ffmpeg.get_ffmpeg_exe()
         return {"available": bool(path), "path": path, "runtime": "imageio-ffmpeg"}
     except Exception as error:
-        return {"available": False, "path": None, "runtime": None, "error": str(error)}
+        return {"available": False, "path": None, "runtime": None, "error": type(error).__name__}
 
 
 def capabilities() -> Dict[str, Any]:
@@ -62,9 +74,12 @@ def capabilities() -> Dict[str, Any]:
         except AttributeError:
             haar_model = False
     ffmpeg = _ffmpeg_info()
+    ffmpeg_public = dict(ffmpeg)
+    if ffmpeg_public.get("path"):
+        ffmpeg_public["path"] = Path(str(ffmpeg_public["path"])).name
     auto_models = _env_flag("SENTINEL_AUTO_DOWNLOAD_MODELS", True)
     return {
-        "ffmpeg": ffmpeg,
+        "ffmpeg": ffmpeg_public,
         "opencv": {"available": cv2 is not None, "error": cv2_error},
         "motion": {
             "available": cv2 is not None or ffmpeg["available"],
@@ -121,7 +136,7 @@ def _base_result(store: EvidenceStore, segment_id: str, kind: str, model: str) -
         "segment_id": segment_id,
         "kind": kind,
         "status": "not_configured",
-        "model": model or "",
+        "model": Path(model).name if model else "",
         "started_at": started,
         "completed_at": started,
         "findings": {
@@ -207,6 +222,15 @@ class _FrameStream:
                     "-hide_banner",
                     "-loglevel",
                     "info",
+                    "-nostdin",
+                    "-threads",
+                    "1",
+                    "-protocol_whitelist",
+                    "file,pipe",
+                    "-timelimit",
+                    "300",
+                    "-max_alloc",
+                    "268435456",
                     "-i",
                     str(self.path),
                     "-map",
@@ -226,8 +250,8 @@ class _FrameStream:
             if not sizes:
                 raise ValueError("FFmpeg did not provide a valid decoded frame size")
             width, height = [int(value) for value in sizes[-1]]
-            if width < 1 or height < 1:
-                raise ValueError("FFmpeg returned an invalid frame size")
+            if not _safe_dimensions(width, height):
+                raise ValueError("FFmpeg returned a frame size above the configured safety limit")
             process = subprocess.Popen(
                 [
                     executable,
@@ -235,6 +259,14 @@ class _FrameStream:
                     "-loglevel",
                     "error",
                     "-nostdin",
+                    "-threads",
+                    "1",
+                    "-protocol_whitelist",
+                    "file,pipe",
+                    "-timelimit",
+                    "300",
+                    "-max_alloc",
+                    "268435456",
                     "-i",
                     str(self.path),
                     "-map",
@@ -279,6 +311,11 @@ class _FrameStream:
         if self._capture is not None:
             ok, frame = self._capture.read()
             if ok and frame is not None:
+                height, width = frame.shape[:2]
+                if not _safe_dimensions(int(width), int(height)):
+                    self.error = "OpenCV returned a frame above the configured safety limit"
+                    self.close()
+                    raise RuntimeError(self.error)
                 index = self.frames
                 self.frames += 1
                 self.decoder = "opencv"
@@ -521,12 +558,12 @@ def _nanodet_predictions(cv2: Any, net: Any, frame: Any) -> List[Dict[str, Any]]
 
 
 def _run_nanodet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: Path, provenance: Dict[str, Any]) -> Dict[str, Any]:
-    result["model"] = str(model_path)
+    result["model"] = provenance.get("filename", model_path.name)
     result["findings"]["model_provenance"] = provenance
     try:
         net = cv2.dnn.readNet(str(model_path))
     except Exception as error:
-        return _finish(result, "unsupported", f"Verified default object model could not be loaded: {error}")
+        return _finish(result, "unsupported", f"Verified object model could not be loaded ({type(error).__name__})")
     items: List[Dict[str, Any]] = []
 
     def process(frame_index: int, frame: Any) -> None:
@@ -534,12 +571,12 @@ def _run_nanodet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path:
             items.append(dict(item, frame=frame_index))
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    result["model"] = str(model_path)
+    result["model"] = provenance.get("filename", model_path.name)
     result["findings"].update({
         "frames_examined": count,
         "items": items,
         "runtime": "opencv-dnn-nanodet-coco",
-        "model_path": str(model_path),
+        "model_filename": provenance.get("filename", model_path.name),
         "model_provenance": provenance,
         "decoder": decoder,
         "nms": {
@@ -627,7 +664,7 @@ def _run_object(result: Dict[str, Any], store_root: Path, media_path: Path, cv2:
         # asset used by automatic provisioning; this keeps labels, tensor
         # decoding, and model provenance bound to one known architecture.
         model_path, provenance = verify_model_file(OBJECT_MODEL, model_path_text)
-        result["model"] = model_path_text
+        result["model"] = OBJECT_MODEL.filename
         result["findings"]["model_provenance"] = provenance
         if model_path is None:
             status = "unsupported" if provenance.get("status") == "invalid" else "not_configured"
@@ -646,14 +683,14 @@ def _run_object(result: Dict[str, Any], store_root: Path, media_path: Path, cv2:
 
 
 def _run_yunet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: Path, provenance: Dict[str, Any]) -> Dict[str, Any]:
-    result["model"] = str(model_path)
+    result["model"] = provenance.get("filename", model_path.name)
     result["findings"]["model_provenance"] = provenance
     if not hasattr(cv2, "FaceDetectorYN_create"):
         return _finish(result, "unsupported", "This OpenCV build does not expose the YuNet face detector")
     try:
         detector = cv2.FaceDetectorYN_create(str(model_path), "", (320, 320), 0.6, 0.3, 5000)
     except Exception as error:
-        return _finish(result, "unsupported", f"Verified YuNet face model could not be loaded: {error}")
+        return _finish(result, "unsupported", f"Verified YuNet face model could not be loaded ({type(error).__name__})")
     items: List[Dict[str, Any]] = []
 
     def process(frame_index: int, frame: Any) -> None:
@@ -681,12 +718,12 @@ def _run_yunet(result: Dict[str, Any], media_path: Path, cv2: Any, model_path: P
             })
 
     count, decoder, error = _process_frames(cv2, media_path, process)
-    result["model"] = str(model_path)
+    result["model"] = provenance.get("filename", model_path.name)
     result["findings"].update({
         "frames_examined": count,
         "items": items,
         "detector": "opencv-yunet",
-        "model_path": str(model_path),
+        "model_filename": provenance.get("filename", model_path.name),
         "model_provenance": provenance,
         "decoder": decoder,
         "nms": {
@@ -766,7 +803,7 @@ def _run_face(result: Dict[str, Any], store_root: Path, media_path: Path, cv2: A
         # hash-verified asset instead of accepting an arbitrary ONNX file that
         # happens to load through FaceDetectorYN.
         explicit_path, provenance = verify_model_file(FACE_MODEL, explicit)
-        result["model"] = explicit
+        result["model"] = FACE_MODEL.filename
         result["findings"]["model_provenance"] = provenance
         if explicit_path is None:
             status = "unsupported" if provenance.get("status") == "invalid" else "not_configured"
@@ -788,7 +825,7 @@ def run_analytics(store: EvidenceStore, segment_id: str, kind: str, model: str =
     except ExportError as error:
         return store.save_analytics(_finish(result, "unsupported", str(error)))
     result["findings"]["media_artifact"] = {
-        "path": media["path"],
+        "filename": media["filename"],
         "sha256": media["sha256"],
         "size": media["size"],
         "payload_range": media.get("payload_range"),
@@ -809,5 +846,5 @@ def run_analytics(store: EvidenceStore, segment_id: str, kind: str, model: str =
         else:
             result = _run_object(result, store.root, media_path, cv2, model)
     except Exception as error:  # optional decoder/model failures are findings, not server failures
-        result = _finish(result, "unsupported", f"Analytics runtime could not process this payload: {error}")
+        result = _finish(result, "unsupported", f"Analytics runtime could not process this payload ({type(error).__name__})")
     return store.save_analytics(result)

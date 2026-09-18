@@ -8,4 +8,8 @@ build/
 dist/
 data/
 .forensic-data/
+.audit-key
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 .DS_Store

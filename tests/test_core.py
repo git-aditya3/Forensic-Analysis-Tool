@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import struct
 import tempfile
 import unittest
@@ -149,8 +150,17 @@ class CoreSystemTests(unittest.TestCase):
     def test_chain_detects_tampering(self):
         self.store.ingest_stream(self.case["id"], io.BytesIO(b"one"), "one.img")
         with self.store._connect() as connection:
+            # Simulate an offline database editor bypassing the in-process
+            # append-only trigger; the keyed custody MAC must still detect it.
+            connection.execute("DROP TRIGGER audit_log_no_update")
             connection.execute("UPDATE audit_log SET payload_json='{}' WHERE id=1")
         self.assertFalse(self.store.verify_chain(self.case["id"])["valid"])
+
+    def test_audit_log_rejects_in_process_updates(self):
+        self.store.ingest_stream(self.case["id"], io.BytesIO(b"one"), "one.img")
+        with self.store._connect() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE audit_log SET payload_json='{}' WHERE id=1")
 
 
 if __name__ == "__main__":

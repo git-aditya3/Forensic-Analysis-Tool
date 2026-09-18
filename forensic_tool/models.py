@@ -112,6 +112,7 @@ class AuditEvent:
     payload: Dict[str, Any]
     previous_hash: str
     event_hash: str
+    event_mac: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

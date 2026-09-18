@@ -5,10 +5,44 @@ let uploadBusy = false;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
-async function api(path, options = {}) {
+function cookieValue(name) {
+  const prefix = `${name}=`;
+  const item = document.cookie.split('; ').find((value) => value.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : '';
+}
+
+function savedApiToken() {
+  try {
+    return window.sessionStorage.getItem('sentinelApiToken') || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function saveApiToken(value) {
+  try {
+    window.sessionStorage.setItem('sentinelApiToken', value);
+  } catch (_) {
+    // Private browsing may deny sessionStorage; cookie-authenticated local
+    // sessions continue to work.
+  }
+}
+
+async function api(path, options = {}, retried = false) {
+  const requestOptions = { ...options, credentials: 'same-origin' };
+  const headers = new Headers(options.headers || {});
+  const token = savedApiToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const method = String(options.method || 'GET').toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrf = cookieValue('sentinel_csrf');
+    if (csrf) headers.set('X-Sentinel-CSRF', csrf);
+  }
+  requestOptions.headers = headers;
+
   let response;
   try {
-    response = await fetch(path, options);
+    response = await fetch(path, requestOptions);
   } catch (error) {
     setApiState(false);
     throw new Error(error.name === 'AbortError' ? 'Request cancelled' : 'The local engine is unreachable');
@@ -19,6 +53,13 @@ async function api(path, options = {}) {
     body = await response.json();
   } catch (_) {
     // Binary downloads and empty responses do not contain JSON.
+  }
+  if (response.status === 401 && !retried) {
+    const entered = window.prompt('This workstation requires its API token. Paste the token printed by forensic-tool:');
+    if (entered && entered.trim()) {
+      saveApiToken(entered.trim());
+      return api(path, options, true);
+    }
   }
   if (!response.ok) {
     throw new Error(body.error || `Request failed (${response.status})`);

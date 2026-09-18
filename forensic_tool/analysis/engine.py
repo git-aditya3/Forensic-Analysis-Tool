@@ -19,6 +19,7 @@ class AnalysisEngine:
         self.store = store
 
     def identify(self, evidence_id: str) -> Dict[str, Any]:
+        self.store.require_intact_evidence(evidence_id)
         reader = self.store.evidence_reader(evidence_id)
         result = detect(reader)
         device_info = identify_device(reader)
@@ -64,6 +65,7 @@ class AnalysisEngine:
         evidence = self.store.get_evidence(evidence_id)
         if not evidence:
             raise KeyError(f"Unknown evidence: {evidence_id}")
+        self.store.require_intact_evidence(evidence_id)
         identity = self._identity(evidence_id)
         vendor = identity["primary_vendor"]
         reader = self.store.evidence_reader(evidence_id)

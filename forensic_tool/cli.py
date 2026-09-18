@@ -34,8 +34,16 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     serve_parser = commands.add_parser("serve", help="start the local browser workstation")
-    serve_parser.add_argument("--host", default="0.0.0.0")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="bind address (loopback by default)")
     serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser.add_argument("--api-token", default=None, help="explicit bearer token; otherwise a high-entropy token is generated")
+    serve_parser.add_argument("--max-upload-bytes", type=int, default=8 * 1024**4)
+    serve_parser.add_argument("--max-connections", type=int, default=32)
+    serve_parser.add_argument(
+        "--allow-insecure-network",
+        action="store_true",
+        help="allow non-loopback HTTP binding; use only behind a trusted TLS reverse proxy",
+    )
 
     case = commands.add_parser("case", help="create, list, or inspect cases")
     case_sub = case.add_subparsers(dest="case_command", required=True)
@@ -97,7 +105,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "serve":
-        serve(args.host, args.port, args.data_dir)
+        try:
+            serve(
+                args.host,
+                args.port,
+                args.data_dir,
+                auth_token=args.api_token,
+                max_upload_bytes=args.max_upload_bytes,
+                max_connections=args.max_connections,
+                allow_insecure_network=args.allow_insecure_network,
+            )
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
         return 0
 
     store = _store(args)

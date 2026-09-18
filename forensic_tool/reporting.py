@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import textwrap
-import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from . import __version__
 from .analysis.timeline import build_timeline
+from .security import atomic_write
 from .storage import EvidenceStore, utc_now
 
 
@@ -106,21 +105,8 @@ def write_report(store: EvidenceStore, case_id: str) -> Dict[str, Any]:
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
-    """Replace a read-only report atomically without opening it for update."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(payload)
-        try:
-            temporary.chmod(0o440)
-        except OSError:
-            pass
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
+    """Replace a read-only report atomically without following symlinks."""
+    atomic_write(path, payload, 0o440)
 
 
 def render_html(report: Dict[str, Any]) -> str:
