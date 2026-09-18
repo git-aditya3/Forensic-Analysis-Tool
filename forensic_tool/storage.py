@@ -534,7 +534,9 @@ class EvidenceStore:
         if not evidence:
             raise KeyError(f"Unknown evidence: {result['evidence_id']}")
         finding_id = result.get("id") or f"AN-{uuid.uuid4().hex[:12].upper()}"
-        result = dict(result, id=finding_id, case_id=evidence["case_id"])
+        findings_json = json.dumps(result.get("findings", {}), sort_keys=True)
+        findings_sha256 = hashlib.sha256(findings_json.encode("utf-8")).hexdigest()
+        result = dict(result, id=finding_id, case_id=evidence["case_id"], findings_sha256=findings_sha256)
         with self._transaction() as connection:
             connection.execute(
                 """INSERT INTO analytics_findings(id,case_id,evidence_id,segment_id,kind,status,model,started_at,completed_at,findings_json,notes)
@@ -549,7 +551,7 @@ class EvidenceStore:
                     result.get("model", ""),
                     result["started_at"],
                     result["completed_at"],
-                    json.dumps(result.get("findings", {}), sort_keys=True),
+                    findings_json,
                     result.get("notes", ""),
                 ),
             )
@@ -563,6 +565,10 @@ class EvidenceStore:
                     "segment_id": result["segment_id"],
                     "kind": result["kind"],
                     "status": result["status"],
+                    "model": result.get("model", ""),
+                    "findings_sha256": findings_sha256,
+                    "source_sha256": result.get("findings", {}).get("source_range", {}).get("sha256"),
+                    "media_sha256": result.get("findings", {}).get("media_artifact", {}).get("sha256"),
                 },
             )
         return result
@@ -576,7 +582,9 @@ class EvidenceStore:
         values = []
         for row in rows:
             value = dict(row)
-            value["findings"] = json.loads(value.pop("findings_json"))
+            findings_json = value.pop("findings_json")
+            value["findings"] = json.loads(findings_json)
+            value["findings_sha256"] = hashlib.sha256(findings_json.encode("utf-8")).hexdigest()
             values.append(value)
         return values
 
@@ -589,7 +597,9 @@ class EvidenceStore:
         values = []
         for row in rows:
             value = dict(row)
-            value["findings"] = json.loads(value.pop("findings_json"))
+            findings_json = value.pop("findings_json")
+            value["findings"] = json.loads(findings_json)
+            value["findings_sha256"] = hashlib.sha256(findings_json.encode("utf-8")).hexdigest()
             values.append(value)
         return values
 

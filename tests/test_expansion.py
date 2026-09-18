@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import sqlite3
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from forensic_tool.analysis.analytics import run_analytics
+from forensic_tool.analysis.analytics import _process_frames, run_analytics
+from forensic_tool.analysis.model_registry import ModelSpec, OBJECT_MODEL, resolve_model
 from forensic_tool.analysis.device import identify_device
 from forensic_tool.analysis.engine import AnalysisEngine
 from forensic_tool.analysis.timeline import build_timeline, normalize_timestamp
@@ -21,6 +25,8 @@ from forensic_tool.storage import EvidenceStore, utc_now
 
 class ExpansionWorkflowTests(unittest.TestCase):
     def setUp(self):
+        self._previous_auto_models = os.environ.get("SENTINEL_AUTO_DOWNLOAD_MODELS")
+        os.environ["SENTINEL_AUTO_DOWNLOAD_MODELS"] = "0"
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "data"
         self.store = EvidenceStore(self.root)
@@ -28,6 +34,10 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.engine = AnalysisEngine(self.store)
 
     def tearDown(self):
+        if self._previous_auto_models is None:
+            os.environ.pop("SENTINEL_AUTO_DOWNLOAD_MODELS", None)
+        else:
+            os.environ["SENTINEL_AUTO_DOWNLOAD_MODELS"] = self._previous_auto_models
         self.temp.cleanup()
 
     def test_capabilities_report_optional_runtime_without_claiming_findings(self):
@@ -36,6 +46,84 @@ class ExpansionWorkflowTests(unittest.TestCase):
         self.assertIn("opencv", capabilities)
         self.assertIn("status_without_model", capabilities["object"])
         self.assertIn(capabilities["object"]["status_without_model"], {"not_configured", "available"})
+
+    def test_verified_model_registry_never_uses_a_corrupt_cache(self):
+        model_path = self.root / "models" / OBJECT_MODEL.filename
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"not a model")
+        resolved, provenance = resolve_model(OBJECT_MODEL, self.root, auto_download=False)
+        self.assertIsNone(resolved)
+        self.assertEqual(provenance["status"], "invalid")
+        self.assertEqual(provenance["expected_sha256"], OBJECT_MODEL.sha256)
+
+    def test_model_provision_is_atomic_and_hash_verified(self):
+        payload = b"verified-model-bytes"
+        spec = ModelSpec(
+            key="test-model",
+            filename="test.onnx",
+            url="https://example.invalid/test.onnx",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size=len(payload),
+            license="MIT",
+            description="test model",
+        )
+
+        class Response:
+            headers = {"Content-Length": str(len(payload))}
+
+            def __enter__(self):
+                self._read = False
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                if self._read:
+                    return b""
+                self._read = True
+                return payload
+
+        with patch("forensic_tool.analysis.model_registry.urlopen", return_value=Response()):
+            model_path, provenance = resolve_model(spec, self.root, auto_download=True)
+        self.assertIsNotNone(model_path)
+        self.assertEqual(provenance["status"], "downloaded")
+        self.assertEqual(Path(model_path).read_bytes(), payload)
+        self.assertEqual(list((self.root / "models").glob("*.download")), [])
+
+    def test_bundled_ffmpeg_fallback_decodes_encoded_frames(self):
+        try:
+            import cv2
+            import imageio_ffmpeg  # noqa: F401
+            import numpy as np
+        except ImportError:
+            self.skipTest("OpenCV and imageio-ffmpeg are not installed in this interpreter")
+        video_path = Path(self.temp.name) / "fallback.avi"
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (64, 48))
+        if not writer.isOpened():
+            self.skipTest("OpenCV could not open its bundled MJPG encoder")
+        for index in range(4):
+            writer.write(np.full((48, 64, 3), index * 60, dtype=np.uint8))
+        writer.release()
+
+        class ClosedCapture:
+            def isOpened(self):
+                return False
+
+            def release(self):
+                return None
+
+        class OpenCVWithoutDecoder:
+            @staticmethod
+            def VideoCapture(_path):
+                return ClosedCapture()
+
+        frames = []
+        count, decoder, error = _process_frames(OpenCVWithoutDecoder(), video_path, lambda index, frame: frames.append((index, frame.shape)))
+        self.assertEqual(count, 4)
+        self.assertEqual(decoder, "ffmpeg")
+        self.assertIsNone(error)
+        self.assertEqual([index for index, _shape in frames], [0, 1, 2, 3])
 
     def test_acquisition_metadata_and_integrity_event(self):
         evidence = self.store.ingest_stream(
@@ -135,6 +223,7 @@ class ExpansionWorkflowTests(unittest.TestCase):
     def test_configured_analytics_processes_real_encoded_frames(self):
         try:
             import cv2
+            import imageio_ffmpeg  # noqa: F401
             import numpy as np
         except ImportError:
             self.skipTest("analytics dependencies are not installed in this interpreter")
@@ -171,10 +260,15 @@ class ExpansionWorkflowTests(unittest.TestCase):
         faces = run_analytics(self.store, segment.id, "face")
         self.assertEqual(motion["status"], "complete")
         self.assertGreater(len(motion["findings"]["items"]), 0)
+        self.assertEqual(motion["findings"]["decoder"], "opencv")
         self.assertEqual(people["status"], "complete")
-        self.assertEqual(people["findings"]["runtime"], "opencv-hog-person")
+        self.assertIn(people["findings"]["runtime"], {"opencv-hog-person", "opencv-dnn-nanodet-coco"})
         self.assertEqual(faces["status"], "complete")
         self.assertEqual(faces["findings"]["frames_examined"], 10)
+        self.assertIn(faces["findings"]["detector"], {"opencv-haar", "opencv-yunet"})
+        mp4 = export_segment(self.store, segment.id, "mp4")
+        self.assertGreater(mp4["size"], 0)
+        self.assertIn("ffmpeg", mp4["note"].lower())
 
     def test_analytics_never_fabricates_without_object_model(self):
         evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(b"not a video\x00\x00\x01\x65frame"), "raw.bin")
@@ -183,7 +277,10 @@ class ExpansionWorkflowTests(unittest.TestCase):
         result = run_analytics(self.store, recovered["segments"][0]["id"], "object")
         self.assertIn(result["status"], {"complete", "not_configured", "unsupported"})
         self.assertEqual(result["findings"]["items"], [])
+        self.assertEqual(len(result["findings_sha256"]), 64)
         self.assertEqual(self.store.list_analytics(recovered["segments"][0]["id"])[0]["id"], result["id"])
+        analytics_event = next(event for event in self.store.audit_events(self.case["id"]) if event["action"] == "analytics_completed")
+        self.assertEqual(analytics_event["payload"]["details"]["findings_sha256"], result["findings_sha256"])
 
     def test_recovery_modes_keep_deleted_overwritten_fragmented_and_unallocated_labels(self):
         evidence = self.store.ingest_stream(self.case["id"], io.BytesIO(b"\x00\x00\x01\x65frame"), "raw.bin")

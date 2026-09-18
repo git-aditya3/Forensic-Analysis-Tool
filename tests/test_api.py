@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,8 @@ from forensic_tool.server import SentinelApp, SentinelHandler
 
 class ApiWorkflowTests(unittest.TestCase):
     def setUp(self):
+        self._previous_auto_models = os.environ.get("SENTINEL_AUTO_DOWNLOAD_MODELS")
+        os.environ["SENTINEL_AUTO_DOWNLOAD_MODELS"] = "0"
         self.temp = tempfile.TemporaryDirectory()
         self.app = SentinelApp(Path(self.temp.name) / "data", static_dir=Path(__file__).parents[1] / "static")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), SentinelHandler)
@@ -26,6 +29,10 @@ class ApiWorkflowTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        if self._previous_auto_models is None:
+            os.environ.pop("SENTINEL_AUTO_DOWNLOAD_MODELS", None)
+        else:
+            os.environ["SENTINEL_AUTO_DOWNLOAD_MODELS"] = self._previous_auto_models
         self.temp.cleanup()
 
     def request(self, path: str, method: str = "GET", body: bytes | None = None, headers: dict | None = None):

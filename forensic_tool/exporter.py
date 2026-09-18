@@ -35,6 +35,20 @@ def _hash_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _ffmpeg_executable() -> tuple[str | None, str | None]:
+    """Return a system FFmpeg or the packaged imageio-ffmpeg executable."""
+    system = shutil.which("ffmpeg")
+    if system:
+        return system, "system-ffmpeg"
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        executable = imageio_ffmpeg.get_ffmpeg_exe()
+        return executable, "imageio-ffmpeg"
+    except Exception:
+        return None, None
+
+
 def _atomic_copy_range(store: EvidenceStore, evidence_id: str, start: int, length: int, destination: Path) -> int:
     reader = store.evidence_reader(evidence_id)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
@@ -154,9 +168,9 @@ def export_segment(store: EvidenceStore, segment_id: str, output_format: str = "
         }
         return _record_export(store, evidence, result)
 
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg, ffmpeg_runtime = _ffmpeg_executable()
     if not ffmpeg:
-        raise ExportError("MP4 export requires ffmpeg; exact native and media exports are available")
+        raise ExportError("MP4 export requires a system or packaged FFmpeg runtime; exact native and media exports are available")
     mp4_path = store.export_path(str(evidence["case_id"]), segment_id, ".mp4")
     # Keep an .mp4 suffix so ffmpeg selects a container for the temporary
     # output; it is atomically renamed to the final artifact afterwards.
@@ -186,7 +200,7 @@ def export_segment(store: EvidenceStore, segment_id: str, output_format: str = "
         "size": mp4_path.stat().st_size,
         "native_sha256": native["sha256"],
         "media_sha256": media["sha256"],
-        "note": "Container remuxed with ffmpeg; native and demuxed source artifacts are retained.",
+        "note": f"Container remuxed with {ffmpeg_runtime or 'FFmpeg'}; native and demuxed source artifacts are retained.",
     })
 
 

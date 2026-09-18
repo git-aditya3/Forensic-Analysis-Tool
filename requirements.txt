@@ -1,4 +1,6 @@
 # Core video analytics dependencies are installed by the project package.
 numpy>=1.24
 opencv-python-headless>=4.8,<5
-# Optional: install ffmpeg separately for MP4 remuxing when required.
+imageio-ffmpeg>=0.6,<1
+# A system ffmpeg remains supported, but the standard install includes a
+# packaged fallback for common container and codec decoding/remuxing.

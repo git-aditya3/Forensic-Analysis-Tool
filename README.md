@@ -4,8 +4,9 @@ Sentinel is a forensic examination system for Digital Video Recorder (DVR)
 and Network Video Recorder (NVR) storage. Its acquisition and recovery core
 uses the Python standard library; the default install also includes OpenCV
 and NumPy so post-acquisition analytics work without a separate model runtime.
-It is
-built around the problem in this repository: recorder vendors such as Dahua,
+It can also provision verified OpenCV Zoo detection models on first analytics
+use, while retaining deterministic offline fallbacks. It is built around the
+problem in this repository: recorder vendors such as Dahua,
 CP Plus, Hikvision, Honeywell, TP-Link, Godrej, Uniview, and Matrix can write
 proprietary storage layouts that appear raw or unformatted to a normal
 operating system.
@@ -46,16 +47,21 @@ operating system.
   physical-range SHA-256, and limitations.
 - **Native and demuxed evidence export** — copies the exact source range and,
   where a parser provides offsets, the exact container payload range without
-  transcoding. Optional MP4 remuxing is used only when an `ffmpeg` executable
-  is installed; native and payload artifacts are retained, hashed, and logged.
+  transcoding. MP4 remuxing and analytics decoding use a system FFmpeg when
+  present or the packaged `imageio-ffmpeg` fallback; native and payload
+  artifacts are retained, hashed, and logged.
 - **Timestamp/correlation workflow** — normalizes known timestamps to UTC with
   explicit timezone assumptions and correlates events across camera channels
   only within a configured tolerance. Untimed candidates remain untimed.
-- **Post-acquisition analytics** — motion frame-difference analysis, bundled
-  OpenCV Haar facial indexing, and an out-of-the-box OpenCV HOG people detector
-  run on derived payload artifacts. An optional ONNX model adds broader object
-  classes. Missing decoders/models return `not_configured` or `unsupported`; no
-  finding is fabricated, and analytics records retain source and derived hashes.
+- **Post-acquisition analytics** — motion-region analysis, a verified YuNet
+  face detector with bundled Haar fallback, and a verified OpenCV Zoo NanoDet
+  COCO detector that is automatically provisioned on first use. This covers
+  people, vehicles, animals, objects, and common scene classes without manual
+  model configuration. Offline mode falls back to Haar/HOG and records the
+  unavailable model provenance explicitly. Missing decoders/models return
+  `not_configured` or `unsupported`; no finding is fabricated, and analytics
+  records retain source ranges, derived hashes, decoder identity, and model
+  hashes.
 - **Chain of custody** — SQLite audit events are hash-linked from a GENESIS
   value. Acquisition, identification, recovery, and report generation are
   recorded and the chain can be verified.
@@ -68,8 +74,10 @@ operating system.
 
 ## Quick start
 
-Python 3.10 or newer is required. The standard install includes NumPy and
-OpenCV headless for motion, built-in people detection, and face indexing.
+Python 3.10 or newer is required. The standard install includes NumPy,
+OpenCV headless, and a packaged FFmpeg fallback. Verified NanoDet and YuNet
+models are downloaded automatically on first analytics use when the workstation
+has network access; no model path needs to be supplied.
 
 ```bash
 python3 -m pip install -e .
@@ -83,7 +91,7 @@ Open <http://localhost:8000>. The browser workflow is:
 2. Acquire an image from the **Acquire evidence** tab.
 3. Select the source under **Analyze & recover** and run identification.
 4. Choose normal, deleted, overwritten, fragmented, or unallocated-space recovery.
-5. Export exact native bytes or a parser-bounded media payload, synchronize the timeline, and run optional analytics.
+5. Export exact native bytes or a parser-bounded media payload, synchronize the timeline, and run analytics.
 6. Verify source hashes and generate the report package.
 
 No source image is included in this repository. The tests use small in-memory
@@ -103,10 +111,11 @@ It creates a temporary evidence image containing a compact Annex-B H.264
 sequence inside common-layout DHAV frames, interleaves two channels, includes a
 malformed frame and raw deleted candidate, then verifies acquisition hashes,
 model/firmware candidates, all recovery postures, exact native/payload export,
-timestamps, custody, reporting, and explicit optional-analytics status. This
-is a regression gate for the workflow, not a substitute for an authorized
-physical image from a named DVR/NVR model. Field validation still requires
-real images and a configured decoder/model where decoded analytics are needed.
+timestamps, custody, reporting, and explicit analytics status. This is a
+regression gate for the workflow, not a substitute for an authorized physical
+image from a named DVR/NVR model. Field validation still requires real images;
+unsupported proprietary payloads remain explicit rather than being treated as
+decoded footage.
 
 ## CLI workflow
 
@@ -133,6 +142,27 @@ python3 -m forensic_tool --data-dir data report CASE-XXXXXXXXXX
 report artifacts. It is ignored by Git. Use a separate, access-controlled
 volume for real examinations.
 
+### Analytics model and decoder behavior
+
+The first object or face run downloads a fixed, hash-verified model into
+`data/models/` (or `SENTINEL_MODEL_DIR` when set). The result records the model
+name, source URL, expected and actual SHA-256, license, decoder, and derived
+artifact hash. This keeps model provenance separate from immutable evidence.
+
+- Object analytics use OpenCV Zoo NanoDet over the COCO classes by default.
+- Face indexing uses YuNet by default, then the OpenCV-bundled Haar cascade if
+  the model cannot be fetched or the examination is offline.
+- Motion uses frame-difference regions and does not assert what caused a change.
+- A packaged FFmpeg fallback broadens decoding beyond OpenCV's native backend;
+  system FFmpeg takes precedence when installed.
+- Set `SENTINEL_AUTO_DOWNLOAD_MODELS=0` for an offline lab. The deterministic
+  fallbacks remain available and the result says exactly which model was not
+  used. Set `SENTINEL_MODEL_DIR` to a controlled, pre-approved model cache.
+
+Face results intentionally remain detection/index records. Sentinel does not
+perform face recognition, name a person, or make a biometric identity claim.
+That boundary is deliberate for forensic accuracy and privacy.
+
 ## API surface
 
 The web server exposes a small JSON API used by the UI:
@@ -157,7 +187,8 @@ The web server exposes a small JSON API used by the UI:
 
 The default upload limit is intentionally large for disk images but can be
 changed by constructing `SentinelApp(max_upload_bytes=...)` when embedding the
-server.
+server. Model licenses, sources, and fixed hashes are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Architecture
 
@@ -170,9 +201,9 @@ SentinelApp ── EvidenceStore (SQLite + immutable byte copies)
      ├── Detector ── vendor profiles and confidence/limitations
      ├── Parser registry ── DHAV / Hikvision / Honeywell / generic routes
      ├── Annex-B carver ── bounded H.264/H.265 physical ranges
-     ├── Exporter ── exact native range, parser-bounded payload, optional ffmpeg remux
+     ├── Exporter ── exact native range, parser-bounded payload, FFmpeg remux fallback
      ├── Timeline ── UTC normalization and conservative cross-camera correlation
-     ├── Analytics ── optional motion / object / face adapters with explicit status
+     ├── Analytics ── verified COCO/YuNet models, decoder fallback, explicit status
      └── Reporter ── JSON / HTML / PDF + hashes, checklist, verified custody chain
 ```
 

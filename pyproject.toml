@@ -13,6 +13,7 @@ authors = [{name = "Aditya"}]
 dependencies = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8,<5",
+    "imageio-ffmpeg>=0.6,<1",
 ]
 
 [project.scripts]
